@@ -68,15 +68,14 @@ inline bool RunSqlToArrow(ClientContext &context, const string &sql, ffi::FFI_Ar
 //! builder so it emits its stats-based file-skip filter. The kernel visits it ONCE, synchronously,
 //! inside `kdf_scan_open` — so the engine state it borrows (the `TableFilterSet`) need only outlive
 //! THIS call. When null, no data-skipping predicate is applied.
-inline string DriveScan(const string &path, int64_t version, bool metadata_only, ClientContext &context,
-                        optional_ptr<ffi::EnginePredicate> predicate = nullptr) {
-	// Drive the kernel scan SM through the kernel-shipped RAII SDK: the ScanStateMachine owns the
-	// KdfSM* (freed on scope exit, including on any throw — no manual catch/free), KernelString owns
-	// each returned SQL string, and every call converts the ABI's out_err into a thrown
-	// KernelException. This replaces the hand-rolled raw-pointer + try/catch double-free bookkeeping.
-	auto sm = delta_kernel::sdk::ScanStateMachine::Open(path, version, metadata_only, predicate.get());
+namespace {
+
+//! Drive a reduce-bearing SM (Snapshot or Scan) to Done, executing each Reduce's SQL in DuckDB and
+//! handing the Arrow result back. Shared by the snapshot and scan phases below — both expose the same
+//! GetStep/ReduceSql/SubmitReduce surface via the RAII SDK.
+template <class Sm>
+inline void DriveToDone(Sm &sm, ClientContext &context) {
 	while (sm.GetStep() == delta_kernel::sdk::Step::Reduce) {
-		// KDF_STEP_REDUCE: kernel hands us SQL; DuckDB runs it; hand the Arrow result back.
 		auto reduce_sql = sm.ReduceSql();
 		ffi::FFI_ArrowArray array {};
 		ffi::FFI_ArrowSchema schema {};
@@ -85,7 +84,21 @@ inline string DriveScan(const string &path, int64_t version, bool metadata_only,
 		}
 		sm.SubmitReduce(&array, &schema);
 	}
-	return sm.ResultSql().str();
+}
+
+} // namespace
+
+inline string DriveScan(const string &path, int64_t version, bool metadata_only, ClientContext &context,
+                        optional_ptr<ffi::EnginePredicate> predicate = nullptr) {
+	// Two kernel SMs, driven through the kernel-shipped RAII SDK: first build the point-in-time
+	// Snapshot, then build a Scan off it and drive that to its ResultPlan. Each handle frees itself on
+	// scope exit (incl. on any thrown KernelException), and every call turns the ABI's out_err into an
+	// exception — no manual raw-pointer or try/catch bookkeeping.
+	auto snapshot = delta_kernel::sdk::Snapshot::Open(path, version);
+	DriveToDone(snapshot, context);
+	auto scan = snapshot.Scan(metadata_only, predicate.get());
+	DriveToDone(scan, context);
+	return scan.ResultSql().str();
 }
 
 } // namespace delta_sdk

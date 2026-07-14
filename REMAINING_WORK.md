@@ -119,9 +119,18 @@ transitively. Committed kernel `06dff7fce`, engine `sm_sdk.hpp`/`CMakeLists.txt`
       into `codegen/include` alongside the patched header.
 - [x] VALIDATED: builds clean, DriveScan rewritten on the SDK, DV-001=1993, full corpus
       **1643/1656** (baseline, no regression).
-- Deferred (not needed yet; add when Stage 2/3 consume them): `Snapshot`/`Scan` RAII adapters,
-  a C++ `EngineRequest` variant (Reduce vs SchemaQuery vs Done) — the SM currently resolves
-  SchemaQuery internally so the engine only ever sees Reduce/Done, which the `Step` enum covers.
+- [x] `Snapshot` / `Scan` RAII adapters (added via a real ABI split, not a façade). The kernel C ABI
+      was split from one fused `KdfSM` into two handles mirroring the kernel's domain model:
+      `KdfSnapshot` (open → drive → `kdf_snapshot_version` → `kdf_snapshot_scan` builds a scan; holds
+      the snapshot as `Arc` so it can build more than one) and `KdfScan` (drive → `ResultPlan`). The
+      ~230-line reduce/step/submit machinery is a generic `ReduceDriver<R>` shared by both. SDK:
+      `Snapshot` (`Open`/`GetStep`/`Reduce*`/`SubmitReduce`/`Version`/`Scan()`) + `Scan`
+      (`GetStep`/`Reduce*`/`SubmitReduce`/`Result*`). `DriveScan` = open Snapshot → drive → `.Scan()`
+      → drive → `ResultSql`. VALIDATED: DV-001=1993, corpus **1643/1656** (baseline). Kernel commits
+      `a395425ed` + `90c3666c7` (`R: 'static` fix); engine `sm_sdk.hpp`.
+- Deferred (add when a consumer needs it): a C++ `EngineRequest` variant (Reduce vs SchemaQuery vs
+  Done) — the SM resolves SchemaQuery internally so the engine only sees Reduce/Done (`Step` covers
+  it); snapshot `schema()` accessor (kernel has `Snapshot::schema()`, no ABI export yet).
 
 ---
 
