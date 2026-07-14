@@ -202,6 +202,13 @@ ExternalProject_Add(
       ${CMAKE_CURRENT_SOURCE_DIR}/scripts/ffi
       ${DELTA_KERNEL_FFI_HEADER_CXX}
       ${CMAKE_BINARY_DIR}/codegen/include
+  # Also place the kernel-shipped RAII SDK header next to the patched FFI header on the include path.
+  # It includes the FFI header via DELTA_KERNEL_SDK_FFI_HEADER (the engine sets that to the patched
+  # generated_delta_kernel_ffi.hpp name), so it must live in the same dir.
+  COMMAND
+    ${CMAKE_COMMAND} -E copy_if_different
+      ${DELTA_KERNEL_FFI_HEADER_PATH}/delta_kernel_sdk.hpp
+      ${CMAKE_BINARY_DIR}/codegen/include/delta_kernel_sdk.hpp
   # Define the byproducts, required for building with Ninja (and so Make knows this target produces
   # the generated proto .cc/.h, else the extension's compile of them fails with "No rule to make").
   # A single BUILD_BYPRODUCTS list: ExternalProject_Add does NOT accumulate a repeated keyword

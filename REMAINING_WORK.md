@@ -102,22 +102,26 @@ Additive; both `_sql` and `_proto` exist in parallel.
 
 ---
 
-## Stage 1.5 — KERNEL-shipped RAII C++ SDK over the C ABI  (#58)
+## Stage 1.5 — KERNEL-shipped RAII C++ SDK over the C ABI  (#58) — DONE + validated
 
-Kernel ships hand-written C++ headers (in `ffi/`, installed alongside the generated
-proto structs) so the engine gets typed, memory-safe adapters — not raw C.
-- [ ] `KernelString` (owns a `char*` from the FFI, frees via `kdf_string_free` in dtor).
-- [ ] `Bytes`/`ProtoBuffer` RAII owner (owns `kdf_sm_result_plan`'s buffer, frees via
-      `kdf_bytes_free`; exposes `->` to the parsed proto message).
-- [ ] `ScanStateMachine` RAII (owns `KdfSM*`, frees via `kdf_sm_free`; wraps
-      get_step/submit/result — replaces the raw loop in `sm_sdk.hpp`).
-- [ ] `Snapshot`, `Scan` RAII adapters (the user explicitly asked for these).
-- [ ] `EngineRequest` variant type on the C++ side (Reduce vs SchemaQuery vs Done)
-      so the driver switches on a typed enum, not raw int codes.
-- [ ] Arrow ownership helpers (who owns the `FFI_ArrowArray`/`Schema` across submit).
-- [ ] These headers must be **exported by the kernel build** and picked up transitively
-      (extend the `generate_delta_kernel_ffi_header` copy step or add the proto-cpp dir +
-      an `sdk/` include dir to the ExternalProject byproducts + include path).
+Kernel ships `ffi/include/delta_kernel_sdk.hpp` (header-only, exceptions-based); `build.rs`
+copies it into `target/ffi-headers/` next to the generated bindings so the engine gets it
+transitively. Committed kernel `06dff7fce`, engine `sm_sdk.hpp`/`CMakeLists.txt`.
+- [x] `KernelString` — owns a `kdf_string_free` char* (the `_sql` transport).
+- [x] `KernelBytes` — owns a `kdf_bytes_free` buffer (the `_plan` proto transport; feed
+      `data()`/`size()` to `ParseFromArray`).
+- [x] `ScanStateMachine` — owns `KdfSM*` (freed on scope exit incl. on throw), typed
+      `Open`/`GetStep`/`ReduceSql`/`ReducePlan`/`SubmitReduce`/`ResultSql`/`ResultPlan`, `Step`
+      enum. Replaced the raw pointer + try/catch double-free loop in `sm_sdk.hpp::DriveScan`.
+- [x] `KernelException` — every call turns `out_err` into a thrown error.
+- [x] FFI-header include is overridable via `DELTA_KERNEL_SDK_FFI_HEADER` (engine points it at
+      its patched `generated_delta_kernel_ffi.hpp`); the ExternalProject copies the SDK header
+      into `codegen/include` alongside the patched header.
+- [x] VALIDATED: builds clean, DriveScan rewritten on the SDK, DV-001=1993, full corpus
+      **1643/1656** (baseline, no regression).
+- Deferred (not needed yet; add when Stage 2/3 consume them): `Snapshot`/`Scan` RAII adapters,
+  a C++ `EngineRequest` variant (Reduce vs SchemaQuery vs Done) — the SM currently resolves
+  SchemaQuery internally so the engine only ever sees Reduce/Done, which the `Step` enum covers.
 
 ---
 

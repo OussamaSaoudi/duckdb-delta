@@ -6,10 +6,18 @@
 // (kdf_sm_reduce_sql) which WE run in DuckDB, then hand the Arrow result back (kdf_sm_submit_reduce).
 // When the SM is Done, kdf_sm_result_sql lowers the terminal ResultPlan to the SQL DuckDB executes.
 // No callback is ever passed into the kernel — the kernel is passive, the engine drives it.
+//
+// The raw `kdf_*` C ABI is wrapped by the kernel-shipped RAII SDK (delta_kernel_sdk.hpp): the driver
+// below trades in ScanStateMachine / KernelString rather than owning pointers + error strings.
 //===----------------------------------------------------------------------===//
 #pragma once
 
 #include "delta_utils.hpp" // generated_delta_kernel_ffi.hpp (ffi::) + duckdb common
+
+// The engine consumes a locally-patched copy of the generated FFI header
+// (generated_delta_kernel_ffi.hpp), so point the kernel-shipped SDK at that name before including it.
+#define DELTA_KERNEL_SDK_FFI_HEADER "generated_delta_kernel_ffi.hpp"
+#include "delta_kernel_sdk.hpp" // kernel-shipped RAII adapters: ScanStateMachine, KernelString, ...
 
 #include "duckdb/common/arrow/arrow.hpp"
 #include "duckdb/common/arrow/arrow_appender.hpp"
@@ -51,14 +59,6 @@ inline bool RunSqlToArrow(ClientContext &context, const string &sql, ffi::FFI_Ar
 	return true;
 }
 
-[[noreturn]] inline void ThrowFfi(char *err, const char *what) {
-	string msg = err ? string(err) : string("unknown error");
-	if (err) {
-		ffi::kdf_string_free(err);
-	}
-	throw IOException("delta SM SDK: %s failed: %s", what, msg);
-}
-
 //! Drive the kernel scan state machine to completion and return the data-stage DuckDB SQL.
 //! `metadata_only` selects the kernel's metadata-only scan SM (file-list terminal) vs the full
 //! data+metadata SM. DuckDB owns the loop and executes every Reduce.
@@ -70,52 +70,22 @@ inline bool RunSqlToArrow(ClientContext &context, const string &sql, ffi::FFI_Ar
 //! THIS call. When null, no data-skipping predicate is applied.
 inline string DriveScan(const string &path, int64_t version, bool metadata_only, ClientContext &context,
                         optional_ptr<ffi::EnginePredicate> predicate = nullptr) {
-	char *err = nullptr;
-	ffi::KdfSM *sm =
-	    ffi::kdf_scan_open(path.c_str(), path.size(), version, metadata_only, predicate.get(), &err);
-	if (!sm) {
-		ThrowFfi(err, "kdf_scan_open");
-	}
-	try {
-		for (;;) {
-			int32_t kind = ffi::kdf_sm_get_step(sm, &err);
-			if (kind < 0) {
-				ThrowFfi(err, "kdf_sm_get_step");
-			}
-			if (kind == ffi::KDF_STEP_DONE) {
-				break;
-			}
-			// KDF_STEP_REDUCE: kernel hands us SQL; DuckDB runs it; hand the Arrow result back.
-			char *sql_c = ffi::kdf_sm_reduce_sql(sm, &err);
-			if (!sql_c) {
-				ThrowFfi(err, "kdf_sm_reduce_sql");
-			}
-			string reduce_sql(sql_c);
-			ffi::kdf_string_free(sql_c);
-
-			ffi::FFI_ArrowArray array {};
-			ffi::FFI_ArrowSchema schema {};
-			if (!RunSqlToArrow(context, reduce_sql, &array, &schema)) {
-				// Do NOT free `sm` here: the catch-all below is the sole owner and frees it on every
-				// throwing path. Freeing here too would double-free `sm` when the catch runs.
-				throw IOException("delta SM SDK: failed to execute reduce SQL in DuckDB");
-			}
-			if (ffi::kdf_sm_submit_reduce(sm, &array, &schema, &err) != 0) {
-				ThrowFfi(err, "kdf_sm_submit_reduce");
-			}
+	// Drive the kernel scan SM through the kernel-shipped RAII SDK: the ScanStateMachine owns the
+	// KdfSM* (freed on scope exit, including on any throw — no manual catch/free), KernelString owns
+	// each returned SQL string, and every call converts the ABI's out_err into a thrown
+	// KernelException. This replaces the hand-rolled raw-pointer + try/catch double-free bookkeeping.
+	auto sm = delta_kernel::sdk::ScanStateMachine::Open(path, version, metadata_only, predicate.get());
+	while (sm.GetStep() == delta_kernel::sdk::Step::Reduce) {
+		// KDF_STEP_REDUCE: kernel hands us SQL; DuckDB runs it; hand the Arrow result back.
+		auto reduce_sql = sm.ReduceSql();
+		ffi::FFI_ArrowArray array {};
+		ffi::FFI_ArrowSchema schema {};
+		if (!RunSqlToArrow(context, reduce_sql.str(), &array, &schema)) {
+			throw IOException("delta SM SDK: failed to execute reduce SQL in DuckDB");
 		}
-		char *out = ffi::kdf_sm_result_sql(sm, &err);
-		if (!out) {
-			ThrowFfi(err, "kdf_sm_result_sql");
-		}
-		string sql(out);
-		ffi::kdf_string_free(out);
-		ffi::kdf_sm_free(sm);
-		return sql;
-	} catch (...) {
-		ffi::kdf_sm_free(sm);
-		throw;
+		sm.SubmitReduce(&array, &schema);
 	}
+	return sm.ResultSql().str();
 }
 
 } // namespace delta_sdk
