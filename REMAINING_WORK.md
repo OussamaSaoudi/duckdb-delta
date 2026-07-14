@@ -68,11 +68,18 @@ This file is the durable, detailed backlog. Task IDs (`#NN`) match the session t
     build: parquet=c++11, core=c++11, delta (with protobuf)=c++17. So folding protobuf INTO the
     extension is a **Stage 2** concern (below), not Stage 0.
 
-**Remaining for Stage 0 (final approach — extension green, protobuf isolated):**
-- [ ] Confirm full `make release` is green (extension back at c++11, verified via flags.make)
-      AND `proto_roundtrip` builds + runs `OK` (build in progress).
-- [ ] Re-run acceptance harness — confirm no regression (baseline 1643/1656). Additive, must stay green.
-- [ ] Commit the duckdb-delta CMake/vcpkg wiring + `test/proto_roundtrip.cpp` (uncommitted).
+**Stage 0 — DONE + validated.**
+- [x] `make release` green, extension at c++11, `proto_roundtrip` runs `OK` (version match).
+- [x] Acceptance harness **1643/1656 — exactly the baseline** (0 regressions; the 13 non-passing are
+      the same pre-existing known-fails: `is_add` struct-key, INTEGER→DATE cast, empty-stats-JSON,
+      unknown-feature). Run on the httpfs-free build (see OpenSSL note) with the DV-001=1993 spot check.
+- [x] Committed: duckdb-delta `74dbda6` (proto-clean branch), kernel `7660bb279`.
+
+**Stage 1 — DONE (kernel side) + validated.**
+- [x] `kdf_sm_reduce_plan` + `pending_reduce_proto` added; `cargo check` green; committed kernel
+      `84e0183fb`. Additive — SQL path still drives, so the 1643/1656 parity above covers it.
+- [ ] (Deferred to Stage 2/3) the ENGINE side actually consuming `kdf_sm_reduce_plan` — that's the
+      DeltaPlanBuilder work; nothing calls the new export yet.
 - [ ] **C++ decode smoke-test**: drive a scan SM → `kdf_sm_result_plan` bytes → parse with the generated C++ `ResultPlan` struct → assert node count/root kind matches. Put it in the `acceptance_harness` or a tiny standalone. This closes the round-trip that the deleted `duckdb_proto_plan.rs` used to cover (a pure-Rust test can't drive a reduce-bearing SM now that DuckDB is the executor).
 - [ ] Re-run the acceptance harness to confirm **no regression** (baseline 1643/1656) — proto wiring is additive, so it must stay green.
 - [ ] Commit the CMake/vcpkg wiring on the duckdb-delta side.
@@ -201,11 +208,16 @@ Design this seam first — it's the load-bearing wall of the whole re-arch.
   touches no TLS code; `proto_roundtrip`, linking neither libduckdb nor curl, runs green). It was
   latent and got exposed when this clean build linked the SYSTEM libcurl (dragging Kerberos → dynamic
   OpenSSL); the httpfs/curl guard above is the same story (httpfs now compiles vs system curl).
-  Precise symbol picture: the UNPREFIXED `OPENSSL_init_ssl`/`OPENSSL_init_crypto`/`CRYPTO_malloc`
-  come from the vcpkg **static** `libssl.a`/`libcrypto.a` (linked by httpfs for TLS); `libduckdb.so`
-  also has a NEEDED on the SYSTEM `libcurl.so.4`, which drags `libgssapi_krb5`→`libkrb5`→**dynamic**
-  `libssl.so.1.1`. (aws-lc-rs is also in the kernel tree but exports PREFIXED `aws_lc_*` symbols, so
-  it is NOT the collision.) Two OpenSSLs, one process, dynamic ctor aborts.
+  Precise symbol picture (VERIFIED): the UNPREFIXED `OPENSSL_init_ssl`/`OPENSSL_init_crypto`/
+  `SSL_new` `T` symbols in the binary come from the vcpkg **static** `libssl.a`/`libcrypto.a`, which
+  **httpfs** links (`httpfs .../CMakeLists.txt: find_package(OpenSSL REQUIRED)`). `libduckdb.so` also
+  has a NEEDED on the SYSTEM `libcurl.so.4`, which drags `libgssapi_krb5`→`libkrb5`→**dynamic**
+  `libssl.so.1.1`. Two OpenSSLs in one process → the dynamic one's `call_init` ctor aborts.
+  IMPORTANT: the kernel does NOT contribute here — `openssl-sys` is not in its dep tree, and aws-lc-rs
+  exports PREFIXED `aws_lc_*` symbols. So dropping the kernel's `OPENSSL_STATIC=1` (done in the Stage-0
+  commit) is correct hygiene but does NOT fix this abort — VERIFIED: shell still cores after that
+  change. The collision is entirely **httpfs (static vcpkg OpenSSL) vs system libcurl (dynamic
+  OpenSSL)**. Fix must target httpfs's OpenSSL or remove httpfs (option d) — NOT the kernel.
   FIX OPTIONS (separate task): (a) build httpfs against a vcpkg curl that uses the SAME OpenSSL the
   kernel statically links (or a curl without gssapi/kerberos); (b) make the kernel link OpenSSL
   dynamically (drop `OPENSSL_STATIC=1`) so there's ONE OpenSSL; (c) use rustls end-to-end and a
