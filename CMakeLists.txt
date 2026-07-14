@@ -79,10 +79,15 @@ if("${OS_NAME}" STREQUAL "linux")
     set(RUST_PLATFORM_TARGET "x86_64-unknown-linux-gnu")
   endif()
 
-  # Point Rust openssl-sys at vcpkg OpenSSL and force static linking
+  # Point Rust openssl-sys at vcpkg OpenSSL. NOTE: the kernel now uses rustls/aws-lc-rs and does NOT
+  # depend on openssl-sys (verified: `cargo tree -i openssl-sys` matches nothing), so these are inert
+  # for the current dependency set. We no longer force OPENSSL_STATIC=1: a statically-linked OpenSSL
+  # here can collide with the SYSTEM libssl that libduckdb pulls transitively (libcurl -> kerberos),
+  # aborting in the dynamic OpenSSL's library constructor at startup. Keeping the LIB/INCLUDE hints in
+  # case a future dependency re-introduces openssl-sys, but defaulting to dynamic to avoid the
+  # dual-OpenSSL abort.
   set(RUST_ENV_VARS
       ${RUST_ENV_VARS}
-      OPENSSL_STATIC=1
       OPENSSL_LIB_DIR=${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/lib
       OPENSSL_INCLUDE_DIR=${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/include)
 elseif("${OS_NAME}" STREQUAL "osx")
@@ -113,6 +118,19 @@ endif()
 set(RUST_PLATFORM_PARAM "--target=${RUST_PLATFORM_TARGET}")
 message(STATUS "Building for rust target: ${RUST_PLATFORM_TARGET}")
 
+# Protobuf: the kernel emits the plan IR as protobuf; the engine decodes it. Use vcpkg's protobuf
+# for BOTH sides — the kernel's build.rs generates the C++ proto structs with THIS protoc (honoring
+# $PROTOC), and we link THIS libprotobuf below, so protoc and the runtime are the same version
+# (protobuf generated code hard-asserts a version match).
+find_package(Protobuf CONFIG REQUIRED)
+if(TARGET protobuf::protoc)
+  set(PROTOC_BIN "$<TARGET_FILE:protobuf::protoc>")
+else()
+  set(PROTOC_BIN "${Protobuf_PROTOC_EXECUTABLE}")
+endif()
+# Feed the kernel's C++ proto codegen (ffi/build.rs) the vcpkg protoc.
+set(RUST_ENV_VARS ${RUST_ENV_VARS} PROTOC=${PROTOC_BIN})
+
 # Remove whitespaces before and after to prevent messed up env variables
 string(STRIP "${RUST_ENV_VARS}" RUST_ENV_VARS)
 
@@ -137,6 +155,9 @@ set(DELTA_KERNEL_LIBPATH
 )
 set(DELTA_KERNEL_FFI_HEADER_PATH
     "${CMAKE_BINARY_DIR}/rust/src/delta_kernel/target/ffi-headers")
+# Dir where the kernel build.rs emits the generated C++ proto structs (declared as ExternalProject
+# byproducts below, compiled into the extension). Defined here so the byproduct paths resolve.
+set(DELTA_PROTO_CPP_DIR "${DELTA_KERNEL_FFI_HEADER_PATH}/proto-cpp")
 set(DELTA_KERNEL_FFI_HEADER_C
     "${CMAKE_BINARY_DIR}/rust/src/delta_kernel/target/ffi-headers/delta_kernel_ffi.h"
 )
@@ -181,15 +202,83 @@ ExternalProject_Add(
       ${CMAKE_CURRENT_SOURCE_DIR}/scripts/ffi
       ${DELTA_KERNEL_FFI_HEADER_CXX}
       ${CMAKE_BINARY_DIR}/codegen/include
-  # Define the byproducts, required for building with Ninja
-  BUILD_BYPRODUCTS "${DELTA_KERNEL_LIBPATH}"
-  BUILD_BYPRODUCTS "${DELTA_KERNEL_FFI_HEADER_C}"
-  BUILD_BYPRODUCTS "${DELTA_KERNEL_FFI_HEADER_CXX}"
+  # Define the byproducts, required for building with Ninja (and so Make knows this target produces
+  # the generated proto .cc/.h, else the extension's compile of them fails with "No rule to make").
+  # A single BUILD_BYPRODUCTS list: ExternalProject_Add does NOT accumulate a repeated keyword
+  # (a later `BUILD_BYPRODUCTS` line silently drops the earlier ones), so list every generated
+  # artifact here. The .pb.cc entries are what teach Make the rule that produces them (else the
+  # delta_proto object compile fails with "No rule to make target plan.pb.cc").
+  BUILD_BYPRODUCTS
+    "${DELTA_KERNEL_LIBPATH}"
+    "${DELTA_KERNEL_FFI_HEADER_C}"
+    "${DELTA_KERNEL_FFI_HEADER_CXX}"
+    "${DELTA_PROTO_CPP_DIR}/plan.pb.cc"
+    "${DELTA_PROTO_CPP_DIR}/expressions.pb.cc"
+    "${DELTA_PROTO_CPP_DIR}/schema.pb.cc"
   INSTALL_COMMAND ""
   LOG_BUILD ON
   LOG_CONFIGURE ON
   LOG_MERGED_STDOUTERR ON
   LOG_OUTPUT_ON_FAILURE ON)
+
+# Kernel-generated C++ proto structs (the plan IR transport). Produced by the delta_kernel
+# ExternalProject's build.rs into target/ffi-headers/proto-cpp with vcpkg's protoc (see PROTOC above).
+# They don't exist at configure time, so we CANNOT list them directly in EXTENSION_SOURCES (the duckdb
+# extension macros would try to compile them before the ExternalProject runs — "No rule to make").
+# Instead compile them into a small OBJECT library that explicitly depends on delta_kernel; that
+# add_dependencies edge orders the codegen before the compile. The extension links the objects.
+set(DELTA_PROTO_SOURCES
+    "${DELTA_PROTO_CPP_DIR}/plan.pb.cc"
+    "${DELTA_PROTO_CPP_DIR}/expressions.pb.cc"
+    "${DELTA_PROTO_CPP_DIR}/schema.pb.cc")
+# The .pb.cc are physically written by the delta_kernel ExternalProject's build.rs. Under the Unix
+# Makefiles generator (CMake 3.16), ExternalProject BUILD_BYPRODUCTS is only advisory — Make never
+# learns a file-level rule that "produces" plan.pb.cc, so compiling it fails with "No rule to make".
+# Give Make an explicit rule via add_custom_command(OUTPUT ...): the command is a no-op (the files
+# already exist once delta_kernel has run), and DEPENDS delta_kernel orders codegen before compile.
+add_custom_command(
+  OUTPUT ${DELTA_PROTO_SOURCES}
+  COMMAND ${CMAKE_COMMAND} -E true
+  DEPENDS delta_kernel
+  COMMENT "Kernel-generated C++ proto structs (produced by delta_kernel build.rs)"
+  VERBATIM)
+set_source_files_properties(${DELTA_PROTO_SOURCES} PROPERTIES GENERATED TRUE)
+
+# delta_proto compiles the kernel-generated .pb.cc. protobuf 33 headers require C++17, so pin it
+# explicitly here (the imported protobuf target's required cxx_std_17 feature would set this anyway).
+# This target is kept ISOLATED — its c++17 must not reach the C++11 shipping extension (see scope
+# note below).
+add_library(delta_proto OBJECT ${DELTA_PROTO_SOURCES})
+add_dependencies(delta_proto delta_kernel)                       # generate the .pb.cc first
+target_include_directories(delta_proto PUBLIC "${DELTA_PROTO_CPP_DIR}")
+target_link_libraries(delta_proto PUBLIC protobuf::libprotobuf)
+set_target_properties(delta_proto PROPERTIES POSITION_INDEPENDENT_CODE ON
+                                             CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+include_directories("${DELTA_PROTO_CPP_DIR}")
+
+# Stage-0 round-trip baseline: a standalone C++17 executable that serialize/parses a ResultPlan using
+# the kernel-generated structs. Proves the codegen compiles, links its matching libprotobuf, and
+# preserves structure. Isolated from the C++11 extension (see scope note below). Built only when the
+# kernel headers exist (i.e. inside a full extension build tree).
+add_executable(proto_roundtrip
+               ${CMAKE_CURRENT_SOURCE_DIR}/test/proto_roundtrip.cpp
+               $<TARGET_OBJECTS:delta_proto>)
+add_dependencies(proto_roundtrip delta_kernel delta_proto)
+target_include_directories(proto_roundtrip PRIVATE "${DELTA_PROTO_CPP_DIR}")
+target_link_libraries(proto_roundtrip protobuf::libprotobuf)
+set_target_properties(proto_roundtrip PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+
+# NOTE (Stage 0 scope): delta_proto compiles the generated .pb.cc in ISOLATION (at c++17) purely to
+# prove the kernel-emitted structs compile and version-match libprotobuf. We deliberately do NOT fold
+# these objects into the shipping extension yet. protobuf 33 / Abseil advertise a *required*
+# cxx_std_17 compile-feature; that is a hard floor CMake will not lower even with an explicit
+# CXX_STANDARD 11 on the target, so any extension target that has protobuf in its link closure is
+# forced to c++17 — which breaks ODR against the C++11-built libduckdb (weak c++17
+# `LogicalType::VARCHAR` inline vars vs libduckdb's strong out-of-line defs). Folding protobuf into
+# the extension belongs in Stage 2, when DeltaPlanBuilder actually decodes the IR inside the
+# extension and the c++11/c++17 boundary is designed on purpose (e.g. an isolated c++17 decode TU
+# that exposes only a non-protobuf C++ surface to the c++11 extension TUs). For Stage 0 the round-trip
+# is a standalone harness (see proto_roundtrip below), and the shipping extension stays untouched/green.
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
@@ -207,14 +296,13 @@ set(CMAKE_OSX_DEPLOYMENT_TARGET
 # Add the default client
 add_compile_definitions(DEFINE_DEFAULT_ENGINE DEFINE_DEFAULT_ENGINE_BASE)
 
-# Link delta-kernal-rs to static lib
-target_link_libraries(${EXTENSION_NAME} ${DELTA_KERNEL_LIBPATH}
-                      ${PLATFORM_LIBS})
+# Link delta-kernal-rs to static lib. (protobuf is intentionally NOT linked here in Stage 0 — see
+# the delta_proto scope note above; that would force the extension to c++17 and break ODR.)
+target_link_libraries(${EXTENSION_NAME} ${DELTA_KERNEL_LIBPATH} ${PLATFORM_LIBS})
 add_dependencies(${EXTENSION_NAME} delta_kernel)
 
 # Link delta-kernal-rs to dynamic lib
-target_link_libraries(${LOADABLE_EXTENSION_NAME} ${DELTA_KERNEL_LIBPATH}
-                      ${PLATFORM_LIBS})
+target_link_libraries(${LOADABLE_EXTENSION_NAME} ${DELTA_KERNEL_LIBPATH} ${PLATFORM_LIBS})
 add_dependencies(${LOADABLE_EXTENSION_NAME} delta_kernel)
 
 install(

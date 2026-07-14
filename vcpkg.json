@@ -1,7 +1,8 @@
 {
     "dependencies": [
         "vcpkg-cmake",
-        "openssl"
+        "openssl",
+        "protobuf"
     ],
     "vcpkg-configuration": {
         "overlay-ports": [
