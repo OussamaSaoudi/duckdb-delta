@@ -275,6 +275,29 @@ target_include_directories(proto_roundtrip PRIVATE "${DELTA_PROTO_CPP_DIR}")
 target_link_libraries(proto_roundtrip protobuf::libprotobuf)
 set_target_properties(proto_roundtrip PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
 
+# Phase D — DeltaPlanBuilder D0 unit test: the proto-IR -> DuckDB TableRef DAG walk + dispatch.
+# A C++17 island executable (like proto_roundtrip): compiles the builder (which includes DuckDB's
+# TableRef + the proto structs) and the walk test, linking the proto objects + libprotobuf + the
+# built DuckDB static lib (TableRef methods). Guarded on the DuckDB source tree being present.
+if(EXISTS "${CMAKE_SOURCE_DIR}/src/include/duckdb.hpp")
+  add_executable(delta_plan_builder_test
+                 ${CMAKE_CURRENT_SOURCE_DIR}/test/delta_plan_builder_test.cpp
+                 ${CMAKE_CURRENT_SOURCE_DIR}/src/functions/delta_scan/delta_plan_builder.cpp
+                 $<TARGET_OBJECTS:delta_proto>)
+  add_dependencies(delta_plan_builder_test delta_kernel delta_proto duckdb_static)
+  target_include_directories(
+    delta_plan_builder_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/include
+            ${CMAKE_SOURCE_DIR}/src/include
+            "${DELTA_PROTO_CPP_DIR}"
+            "${CMAKE_BINARY_DIR}/codegen/include")
+  # The island consumes the engine's patched FFI header name (delta_kernel.hpp -> generated_...).
+  target_compile_definitions(delta_plan_builder_test PRIVATE
+                             DELTA_KERNEL_FFI_HEADER="generated_delta_kernel_ffi.hpp")
+  target_link_libraries(delta_plan_builder_test protobuf::libprotobuf duckdb_static ${PLATFORM_LIBS})
+  set_target_properties(delta_plan_builder_test PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+endif()
+
 # NOTE (Stage 0 scope): delta_proto compiles the generated .pb.cc in ISOLATION (at c++17) purely to
 # prove the kernel-emitted structs compile and version-match libprotobuf. We deliberately do NOT fold
 # these objects into the shipping extension yet. protobuf 33 / Abseil advertise a *required*
