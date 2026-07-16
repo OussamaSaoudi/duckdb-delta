@@ -168,6 +168,12 @@ public:
 	//! (reads only the immutable-after-bind GetPath()/version/global_columns/table_filters).
 	string BuildReconciliationSQL(ClientContext &context) const;
 
+	//! The proto-IR analogue of BuildReconciliationSQL: lower the metadata-only scan (with the same
+	//! pushed-down predicate) to a DuckDB unbound TableRef via DeltaPlanBuilder (SQL fallback inside the
+	//! facade). The optimizer binds this TableRef into the same visible child subplan. Same immutable
+	//! reads, no lock.
+	unique_ptr<TableRef> BuildReconciliationRef(ClientContext &context) const;
+
 	void EnsureSnapshotInitialized() const;
 	void EnsureScanInitialized() const;
 

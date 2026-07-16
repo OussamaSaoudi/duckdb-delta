@@ -1,6 +1,7 @@
 #include "functions/delta_scan/delta_scan.hpp"
 #include "functions/delta_scan/delta_multi_file_list.hpp"
 #include "functions/delta_scan/delta_multi_file_reader.hpp"
+#include "functions/delta_scan/delta_scan_ir.hpp" // BuildDeltaScanRef (proto-IR path facade)
 #include "functions/delta_scan/sm_sdk.hpp"
 
 #include "duckdb/main/connection.hpp"
@@ -1038,6 +1039,19 @@ string DeltaMultiFileList::BuildReconciliationSQL(ClientContext &context) const 
 		                  visitor.error_data.Message());
 	}
 	return sql;
+}
+
+unique_ptr<TableRef> DeltaMultiFileList::BuildReconciliationRef(ClientContext &context) const {
+	// Same inputs as BuildReconciliationSQL — the pushed-down table_filters + global_columns — but the
+	// facade builds the kernel data-skipping predicate itself and lowers via DeltaPlanBuilder (SQL
+	// fallback inside). We hand it an optional_ptr to table_filters only when non-empty so no predicate
+	// is threaded for an unfiltered scan.
+	int64_t sm_version = (version == DConstants::INVALID_INDEX) ? -1 : static_cast<int64_t>(version);
+	optional_ptr<const TableFilterSet> filters;
+	if (!table_filters.filters.empty()) {
+		filters = &table_filters;
+	}
+	return BuildDeltaScanRef(GetPath(), sm_version, DeltaScanIRKind::Metadata, global_columns, filters, context);
 }
 
 void DeltaMultiFileList::EnsureSnapshotInitialized() const {

@@ -18,6 +18,7 @@
 #include "duckdb/common/multi_file/multi_file_data.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "functions/delta_scan/delta_multi_file_list.hpp"
+#include "functions/delta_scan/delta_scan_ir.hpp" // BuildDeltaScanRef (proto-IR path facade)
 #include "functions/delta_scan/sm_sdk.hpp"
 
 namespace duckdb {
@@ -138,14 +139,9 @@ static unique_ptr<TableRef> DeltaScanMetadataBindReplace(ClientContext &context,
 			scan_version = (v < 0) ? -1 : v;
 		}
 	}
-	string sql = delta_sdk::DriveScan(table_path, scan_version, /* metadata_only= */ true, context);
-	Parser parser;
-	parser.ParseQuery(sql);
-	if (parser.statements.size() != 1 || parser.statements[0]->type != StatementType::SELECT_STATEMENT) {
-		throw IOException("delta_scan_metadata: expected a single SELECT statement from plan lowering");
-	}
-	auto select = unique_ptr_cast<SQLStatement, SelectStatement>(std::move(parser.statements[0]));
-	return make_uniq<SubqueryRef>(std::move(select));
+	// Lower the metadata-only scan via the proto-IR path (DeltaPlanBuilder), falling back to the SQL
+	// path inside the facade if a node isn't lowerable yet. No pushdown filters at this TVF.
+	return BuildDeltaScanRef(table_path, scan_version, DeltaScanIRKind::Metadata, {}, nullptr, context);
 }
 
 // in_out stub for delta_load: never executed (bind_operator routes the call to PhysicalDeltaLoad,

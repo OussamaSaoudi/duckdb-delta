@@ -13,7 +13,9 @@
 #include "duckdb/parallel/pipeline.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/binder.hpp"
-#include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/expression/star_expression.hpp"
+#include "duckdb/parser/query_node/select_node.hpp"
+#include "duckdb/parser/statement/select_statement.hpp"
 
 #include <cstdlib>
 
@@ -106,22 +108,26 @@ static void DeltaScanAttachReconciliationSubplan(LogicalDeltaGet &op, OptimizerE
 		return;
 	}
 
-	// Lower the kernel metadata-only scan SM to reconciliation SQL WITH the pushed-down predicate baked
-	// in (the stats-based file-skip FILTER over add.stats_parsed is present exactly when a WHERE predicate
-	// reached table_filters). DuckDB drives the SM (executes each Reduce) inside here.
-	string sql = delta_list->BuildReconciliationSQL(input.context);
+	// Lower the kernel metadata-only scan SM to a reconciliation TableRef via the proto-IR path
+	// (DeltaPlanBuilder), WITH the pushed-down predicate baked in (the stats-based file-skip FILTER over
+	// add.stats_parsed is present exactly when a WHERE predicate reached table_filters). DuckDB drives
+	// the SM (executes each Reduce) inside the facade, which falls back to the SQL path per-scan if a
+	// node isn't lowerable yet.
+	auto recon_ref = delta_list->BuildReconciliationRef(input.context);
 
-	// Parse + bind the SQL into a fully-planned child LogicalOperator. The child binder shares the query's
-	// GlobalBinderState (bound_tables counter) with the main plan's binder, so it allocates FRESH table
-	// indices past every main-plan index — no binding collisions. Done post-pushdown so the predicate is
-	// known.
-	Parser parser;
-	parser.ParseQuery(sql);
-	if (parser.statements.size() != 1 || parser.statements[0]->type != StatementType::SELECT_STATEMENT) {
-		throw IOException("delta_scan: expected a single SELECT statement from reconciliation lowering");
-	}
+	// Bind the TableRef into a fully-planned child LogicalOperator. Wrap it as `SELECT * FROM (<ref>)`
+	// so it binds as a query. The child binder shares the query's GlobalBinderState (bound_tables
+	// counter) with the main plan's binder, so it allocates FRESH table indices past every main-plan
+	// index — no binding collisions. Done post-pushdown so the predicate is known.
+	auto recon_select = make_uniq<SelectNode>();
+	recon_select->select_list.push_back(make_uniq<StarExpression>());
+	recon_select->from_table = std::move(recon_ref);
+	auto recon_stmt = make_uniq<SelectStatement>();
+	recon_stmt->node = std::move(recon_select);
 	auto child_binder = Binder::CreateBinder(input.context, &input.optimizer.binder);
-	auto bound = child_binder->Bind(*parser.statements[0]);
+	// Bind through the public SQLStatement& overload (Bind(SelectStatement&) is private).
+	SQLStatement &recon_sql_stmt = *recon_stmt;
+	auto bound = child_binder->Bind(recon_sql_stmt);
 	if (!bound.plan) {
 		throw IOException("delta_scan: failed to bind reconciliation subplan");
 	}
