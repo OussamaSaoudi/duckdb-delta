@@ -57,6 +57,9 @@ bool RunStatementToArrow(ClientContext &context, unique_ptr<SelectStatement> stm
 	Connection con(*context.db);
 	auto result = con.Query(std::move(stmt));
 	if (!result || result->HasError()) {
+		if (std::getenv("DELTA_SCAN_IR_TRACE") && result) {
+			fprintf(stderr, "[delta_scan_ir] reduce query error: %s\n", result->GetError().c_str());
+		}
 		return false;
 	}
 	ClientProperties props = context.GetClientProperties();
@@ -87,6 +90,9 @@ public:
 		// SM records); stream the single batch lazily so the SDK's apply_all loop drives it.
 		DeltaPlanBuilder builder;
 		auto ref = builder.Lower(plan);
+		if (std::getenv("DELTA_SCAN_IR_TRACE")) {
+			fprintf(stderr, "[delta_scan_ir] reduce lowered SQL: %s\n", ref->ToString().c_str());
+		}
 		auto stmt = SelectStarFrom(std::move(ref));
 		auto shared_stmt = std::make_shared<unique_ptr<SelectStatement>>(std::move(stmt));
 		auto done = std::make_shared<bool>(false);

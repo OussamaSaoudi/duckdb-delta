@@ -10,6 +10,8 @@
 
 #include "delta_kernel.hpp" // delta::DeltaError
 
+#include <atomic>
+
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/parser/expression/cast_expression.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
@@ -37,6 +39,19 @@ using ::delta::kernel::plan::ResultPlan;
 using ::delta::kernel::plan::ScanParquetNode;
 
 namespace {
+
+//! Wrap a SelectStatement in a SubqueryRef with a unique non-empty alias (see definition below for
+//! why every emitted subquery must be aliased). Forward-declared so the leaf lowerings can use it.
+unique_ptr<TableRef> MakeAliasedSubquery(unique_ptr<SelectStatement> stmt);
+
+//! A process-unique, non-empty table alias with the given prefix. Every from-table a node emits must
+//! carry one: DuckDB's `SELECT *` star-expansion qualifies each expanded column with the source's
+//! binding alias, and an unset alias trips `BindingAlias::GetAlias on a non-set alias` (INTERNAL
+//! Error). The SQL parser auto-aliases every table; hand-built TableRefs must set it explicitly.
+inline std::string NextAlias(const char *prefix) {
+	static std::atomic<uint64_t> counter {0};
+	return std::string(prefix) + std::to_string(counter.fetch_add(1));
+}
 
 //! Human-readable name for an Operator oneof case (for the unsupported-node error message).
 const char *OpCaseName(Operator::OpCase c) {
@@ -125,6 +140,7 @@ unique_ptr<TableRef> ReadParquetRef(const ScanParquetNode &scan) {
 
 	auto ref = make_uniq<TableFunctionRef>();
 	ref->function = make_uniq<FunctionExpression>("read_parquet", std::move(args));
+	ref->alias = NextAlias("dkrp_");
 	return ref;
 }
 
@@ -157,7 +173,7 @@ unique_ptr<TableRef> LowerScanParquet(const ScanParquetNode &scan) {
 
 	auto stmt = make_uniq<SelectStatement>();
 	stmt->node = std::move(select);
-	return make_uniq<SubqueryRef>(std::move(stmt));
+	return MakeAliasedSubquery(std::move(stmt));
 }
 
 //! Move out input `i` of a node, checking arity so an unexpected plan shape becomes a clean
@@ -170,11 +186,24 @@ unique_ptr<TableRef> TakeInput(const PlanNode &node, vector<unique_ptr<TableRef>
 	return std::move(inputs[i]);
 }
 
+//! Wrap a SelectStatement in a SubqueryRef with a UNIQUE non-empty alias. Every subquery a node emits
+//! must be aliased: DuckDB's star expansion (`SELECT *` over the subquery) qualifies each expanded
+//! column with the subquery's binding alias, and an unset alias trips
+//! `BindingAlias::GetAlias on a non-set alias` (INTERNAL Error) when the plan nests subqueries. The
+//! SQL path never hit this because the SQL parser auto-aliases every subquery; hand-built TableRefs do
+//! not, so we stamp a unique alias here. Counter is per-process; only uniqueness + non-empty matter.
+unique_ptr<TableRef> MakeAliasedSubquery(unique_ptr<SelectStatement> stmt) {
+	static std::atomic<uint64_t> counter {0};
+	auto sub = make_uniq<SubqueryRef>(std::move(stmt));
+	sub->alias = "dksub_" + std::to_string(counter.fetch_add(1));
+	return sub;
+}
+
 //! Wrap a SelectNode as a subquery TableRef (the uniform way a node hands its relation to its parent).
 unique_ptr<TableRef> AsSubquery(unique_ptr<SelectNode> select) {
 	auto stmt = make_uniq<SelectStatement>();
 	stmt->node = std::move(select);
-	return make_uniq<SubqueryRef>(std::move(stmt));
+	return MakeAliasedSubquery(std::move(stmt));
 }
 
 //! Lower a Filter node: `SELECT * FROM <input> WHERE <predicate>`.
@@ -224,8 +253,14 @@ unique_ptr<TableRef> LowerValues(const ::delta::kernel::plan::ValuesNode &values
 		return AsSubquery(std::move(select));
 	}
 
-	// Build an ExpressionListRef (VALUES) and give it the schema's column-name aliases.
+	// Build an ExpressionListRef (VALUES) and give it the schema's column-name aliases PLUS a table
+	// alias. The binder registers the VALUES relation's binding under `alias` (AddGenericBinding);
+	// leaving it empty makes a downstream `SELECT *` expansion call GetAlias() on a non-set binding
+	// alias -> `BindingAlias::GetAlias on a non-set alias` INTERNAL Error. Every from-table needs a
+	// non-empty alias (the SQL parser auto-assigns one; hand-built refs must set it).
+	static std::atomic<uint64_t> values_counter {0};
 	auto rows_ref = make_uniq<ExpressionListRef>();
+	rows_ref->alias = "dkvalues_" + std::to_string(values_counter.fetch_add(1));
 	rows_ref->expected_types = types;
 	rows_ref->expected_names = names;
 	for (int r = 0; r < values.rows_size(); r++) {
@@ -273,6 +308,7 @@ unique_ptr<TableRef> ReadJsonRef(const ::delta::kernel::plan::ScanJsonNode &scan
 
 	auto ref = make_uniq<TableFunctionRef>();
 	ref->function = make_uniq<FunctionExpression>("read_json", std::move(args));
+	ref->alias = NextAlias("dkrj_");
 	return ref;
 }
 
@@ -439,6 +475,7 @@ unique_ptr<TableRef> LowerLoad(const ::delta::kernel::plan::LoadNode &load, uniq
 
 	auto ref = make_uniq<TableFunctionRef>();
 	ref->function = make_uniq<FunctionExpression>("delta_load", std::move(args));
+	ref->alias = NextAlias("dkdl_");
 	return ref;
 }
 
@@ -551,7 +588,7 @@ unique_ptr<TableRef> LowerUnionAll(vector<unique_ptr<TableRef>> inputs) {
 	if (inputs.size() == 1) {
 		auto stmt = make_uniq<SelectStatement>();
 		stmt->node = make_child(std::move(inputs[0]));
-		return make_uniq<SubqueryRef>(std::move(stmt));
+		return MakeAliasedSubquery(std::move(stmt));
 	}
 	auto setop = make_uniq<SetOperationNode>();
 	setop->setop_type = SetOperationType::UNION_BY_NAME;
@@ -561,7 +598,7 @@ unique_ptr<TableRef> LowerUnionAll(vector<unique_ptr<TableRef>> inputs) {
 	}
 	auto stmt = make_uniq<SelectStatement>();
 	stmt->node = std::move(setop);
-	return make_uniq<SubqueryRef>(std::move(stmt));
+	return MakeAliasedSubquery(std::move(stmt));
 }
 
 } // namespace

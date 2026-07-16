@@ -41,6 +41,9 @@ inline bool RunSqlToArrow(ClientContext &context, const string &sql, ffi::FFI_Ar
 	Connection con(*context.db);
 	auto result = con.Query(sql);
 	if (!result || result->HasError()) {
+		if (std::getenv("DELTA_SCAN_IR_TRACE") && result) {
+			fprintf(stderr, "[delta_sdk] reduce SQL error: %s\nSQL: %s\n", result->GetError().c_str(), sql.c_str());
+		}
 		return false;
 	}
 	ClientProperties props = context.GetClientProperties();
