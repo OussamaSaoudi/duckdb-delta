@@ -358,6 +358,16 @@ static unique_ptr<LogicalOperator> DeltaLoadBindOperator(ClientContext &context,
 	if (op->build_path_col == DConstants::INVALID_INDEX) {
 		throw IOException("delta_load: input relation is missing the 'path' column");
 	}
+	if (std::getenv("DELTA_SCAN_IR_TRACE")) {
+		string cols;
+		for (idx_t c = 0; c < input.input_table_names.size(); c++) {
+			cols += (c ? "," : "") + std::to_string(c) + ":" + input.input_table_names[c] + ":" +
+			        input.input_table_types[c].ToString();
+		}
+		fprintf(stderr, "[delta_load bind] input cols=[%s] build_path_col=%llu fcv=%llu dv=%llu\n", cols.c_str(),
+		        (unsigned long long)op->build_path_col, (unsigned long long)op->build_fcv_col,
+		        (unsigned long long)op->build_dv_col);
+	}
 	return std::move(op);
 }
 

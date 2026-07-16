@@ -256,6 +256,16 @@ SinkResultType PhysicalDeltaLoad::Sink(ExecutionContext &context, DataChunk &chu
 	auto &lstate = input.local_state.Cast<DeltaScanBuildLocalState>();
 	auto &file_list = GetDeltaFileList(*bind_data);
 	chunk.Flatten();
+	if (std::getenv("DELTA_SCAN_IR_TRACE")) {
+		string cols;
+		for (idx_t c = 0; c < chunk.ColumnCount(); c++) {
+			cols += (c ? " | " : "") + std::to_string(c) + "=" +
+			        (chunk.size() ? chunk.GetValue(c, 0).ToString() : string("<empty>"));
+		}
+		fprintf(stderr, "[delta_load Sink] build_path_col=%llu chunk.cols=%llu size=%llu row0=[%s]\n",
+		        (unsigned long long)build_path_col, (unsigned long long)chunk.ColumnCount(),
+		        (unsigned long long)chunk.size(), cols.c_str());
+	}
 	lstate.entries.clear();
 	for (idx_t r = 0; r < chunk.size(); r++) {
 		Value path_val = chunk.GetValue(build_path_col, r);
