@@ -315,12 +315,23 @@ static unique_ptr<LogicalOperator> DeltaLoadBindOperator(ClientContext &context,
 	// delta layer is reader-agnostic; only the leaf file parsing differs.
 	TableFunction inner_function = table_function; // parquet base (default)
 	named_parameter_map_t inner_named;
+	// The reader interface needs its own bind-time TableFunctionInfo: parquet's bind wants none, but the JSON
+	// interface's InitializeOptions casts the bind input's `info` to JSONScanInfo to read the scan type/format.
+	// This is a SEPARATE slot from inner_function.function_info, which DeltaMultiFileReader::CreateInstance
+	// reads (as DeltaFunctionInfo) to pick up the snapshot. Keep them distinct: load_info drives the reader,
+	// reader_scan_info (read_json's own JSONScanInfo) drives the JSON bind.
+	shared_ptr<TableFunctionInfo> reader_scan_info = load_info;
 	if (file_type == "json") {
 		ExtensionHelper::AutoLoadExtension(context, "json");
 		auto &json_entry =
 		    Catalog::GetSystemCatalog(context).GetEntry<TableFunctionCatalogEntry>(context, DEFAULT_SCHEMA, "read_json");
 		inner_function = json_entry.functions.functions[0];
 		inner_function.get_multi_file_reader = DeltaMultiFileReader::CreateInstance;
+		// read_json's catalog TableFunction carries a JSONScanInfo (scan type = READ_JSON) in function_info.
+		// Use it as the reader's bind info so JSONMultiFileInfo::InitializeOptions sets options.type correctly
+		// (otherwise the leaf JSONReader::Scan throws "Unsupported scan type"). The snapshot is delivered
+		// separately via inner_function.function_info = load_info below.
+		reader_scan_info = inner_function.function_info;
 		inner_function.function_info = load_info;
 		// read_json needs the explicit column schema (no auto-detect) + newline-delimited format. The
 		// `columns` param is a STRUCT mapping each name to its DuckDB type as a VARCHAR spec — the same
@@ -340,7 +351,7 @@ static unique_ptr<LogicalOperator> DeltaLoadBindOperator(ClientContext &context,
 	inner_inputs.emplace_back(Value(base_url));
 	vector<LogicalType> inner_in_types;
 	vector<string> inner_in_names;
-	TableFunctionBindInput inner(inner_inputs, inner_named, inner_in_types, inner_in_names, load_info.get(),
+	TableFunctionBindInput inner(inner_inputs, inner_named, inner_in_types, inner_in_names, reader_scan_info.get(),
 	                             input.binder.get(), inner_function, input.ref);
 	vector<string> inner_names;
 	vector<LogicalType> inner_types;

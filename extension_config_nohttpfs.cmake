@@ -10,3 +10,9 @@ duckdb_extension_load(delta
     SOURCE_DIR ${CMAKE_CURRENT_LIST_DIR}
     LOAD_TESTS
 )
+
+# Build the in-tree json extension from source (DONT_LINK: loaded at runtime, not statically linked)
+# so the metadata reconciliation's delta_load(file_type:='json') exercises OUR patched json reader
+# (JSONMultiFileInfo::FinalizeBindData initializes parser state on the custom MultiFileReader::Bind
+# path). Without this the CLI autoloads the prebuilt installed json extension, which crashes.
+duckdb_extension_load(json)
