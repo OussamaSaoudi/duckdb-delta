@@ -307,12 +307,37 @@ static unique_ptr<LogicalOperator> DeltaLoadBindOperator(ClientContext &context,
 	auto load_info = make_shared_ptr<DeltaFunctionInfo>();
 	load_info->snapshot = provided_list;
 	load_info->table_name = base_url;
-	TableFunction inner_function = table_function;
-	inner_function.function_info = load_info;
+
+	// Pick the per-file READER interface by file_type. delta_load is registered on parquet_scan, but a
+	// JSON commit/manifest Load must parse newline-delimited JSON, not parquet. read_json is the same
+	// MultiFileReader framework as parquet_scan, so we swap the base scan function to read_json here and
+	// keep DeltaMultiFileReader as the file-list/DV/broadcast layer (get_multi_file_reader below). The
+	// delta layer is reader-agnostic; only the leaf file parsing differs.
+	TableFunction inner_function = table_function; // parquet base (default)
+	named_parameter_map_t inner_named;
+	if (file_type == "json") {
+		ExtensionHelper::AutoLoadExtension(context, "json");
+		auto &json_entry =
+		    Catalog::GetSystemCatalog(context).GetEntry<TableFunctionCatalogEntry>(context, DEFAULT_SCHEMA, "read_json");
+		inner_function = json_entry.functions.functions[0];
+		inner_function.get_multi_file_reader = DeltaMultiFileReader::CreateInstance;
+		inner_function.function_info = load_info;
+		// read_json needs the explicit column schema (no auto-detect) + newline-delimited format. The
+		// `columns` param is a STRUCT mapping each name to its DuckDB type as a VARCHAR spec — the same
+		// shape the SQL commit-read path used. Build it from the resolved file schema (fs).
+		child_list_t<Value> col_specs;
+		for (auto &p : fs) {
+			col_specs.emplace_back(p.first, Value(p.second.ToString()));
+		}
+		inner_named["columns"] = Value::STRUCT(std::move(col_specs));
+		inner_named["format"] = Value("newline_delimited");
+		inner_named["auto_detect"] = Value::BOOLEAN(false);
+	} else {
+		inner_function.function_info = load_info;
+	}
 
 	vector<Value> inner_inputs;
 	inner_inputs.emplace_back(Value(base_url));
-	named_parameter_map_t inner_named;
 	vector<LogicalType> inner_in_types;
 	vector<string> inner_in_names;
 	TableFunctionBindInput inner(inner_inputs, inner_named, inner_in_types, inner_in_names, load_info.get(),

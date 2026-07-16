@@ -33,6 +33,9 @@
 #include "duckdb/planner/operator/logical_extension_operator.hpp"
 #include "duckdb/planner/table_filter.hpp"
 
+#include <cstdio>
+#include <cstdlib>
+
 namespace duckdb {
 
 class DBConfig;
@@ -146,6 +149,10 @@ struct LogicalDeltaGet : public LogicalExtensionOperator {
 			for (idx_t i = 0; i < child_bindings.size(); i++) {
 				expressions.push_back(make_uniq<BoundColumnRefExpression>(child_types[i], child_bindings[i]));
 			}
+		}
+		if (std::getenv("DELTA_SCAN_IR_TRACE")) {
+			fprintf(stderr, "[LogicalDeltaGet::ResolveTypes] children=%llu expressions=%llu\n",
+			        (unsigned long long)children.size(), (unsigned long long)expressions.size());
 		}
 	}
 
