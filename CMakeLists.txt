@@ -209,6 +209,13 @@ ExternalProject_Add(
     ${CMAKE_COMMAND} -E copy_if_different
       ${DELTA_KERNEL_FFI_HEADER_PATH}/delta_kernel_sdk.hpp
       ${CMAKE_BINARY_DIR}/codegen/include/delta_kernel_sdk.hpp
+  # And the new proto-IR C++ API header (delta_kernel.hpp, Phase C). Same rationale: it includes the
+  # FFI header via DELTA_KERNEL_FFI_HEADER (the DeltaPlanBuilder island sets that to the patched
+  # generated_delta_kernel_ffi.hpp name), plus plan.pb.h/schema.pb.h from the proto-cpp dir.
+  COMMAND
+    ${CMAKE_COMMAND} -E copy_if_different
+      ${DELTA_KERNEL_FFI_HEADER_PATH}/delta_kernel.hpp
+      ${CMAKE_BINARY_DIR}/codegen/include/delta_kernel.hpp
   # Define the byproducts, required for building with Ninja (and so Make knows this target produces
   # the generated proto .cc/.h, else the extension's compile of them fails with "No rule to make").
   # A single BUILD_BYPRODUCTS list: ExternalProject_Add does NOT accumulate a repeated keyword
@@ -283,6 +290,7 @@ if(EXISTS "${CMAKE_SOURCE_DIR}/src/include/duckdb.hpp")
   add_executable(delta_plan_builder_test
                  ${CMAKE_CURRENT_SOURCE_DIR}/test/delta_plan_builder_test.cpp
                  ${CMAKE_CURRENT_SOURCE_DIR}/src/functions/delta_scan/delta_plan_builder.cpp
+                 ${CMAKE_CURRENT_SOURCE_DIR}/src/functions/delta_scan/delta_proto_lower.cpp
                  $<TARGET_OBJECTS:delta_proto>)
   add_dependencies(delta_plan_builder_test delta_kernel delta_proto duckdb_static)
   target_include_directories(
@@ -294,6 +302,14 @@ if(EXISTS "${CMAKE_SOURCE_DIR}/src/include/duckdb.hpp")
   # The island consumes the engine's patched FFI header name (delta_kernel.hpp -> generated_...).
   target_compile_definitions(delta_plan_builder_test PRIVATE
                              DELTA_KERNEL_FFI_HEADER="generated_delta_kernel_ffi.hpp")
+  # Link ONLY duckdb_static — the test builds parser TableRefs and calls ToString(); it never
+  # constructs a DuckDB instance, opens a database, or runs a query. We deliberately avoid both the
+  # shared libduckdb.so (it pulls libcurl -> libssl/libcrypto.so.1.1 + kerberos, whose constructor
+  # collides with the system OpenSSL and aborts in ASN1_item_ex_i2d during static init, before main --
+  # the dual-OpenSSL hazard documented in the RUST_ENV_VARS note above) and the generated
+  # extension-loader archive (it drags in every bundled extension incl. httpfs, re-introducing the SSL
+  # pull). The one symbol duckdb_static's DuckDB ctor references from that archive,
+  # ExtensionHelper::LoadAllExtensions, is stubbed no-op in the test TU (it is never called here).
   target_link_libraries(delta_plan_builder_test protobuf::libprotobuf duckdb_static ${PLATFORM_LIBS})
   set_target_properties(delta_plan_builder_test PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
 endif()

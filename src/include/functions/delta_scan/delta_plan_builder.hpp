@@ -38,13 +38,23 @@ public:
 	unique_ptr<TableRef> Lower(const ::delta::kernel::plan::ResultPlan &result_plan);
 
 private:
-	//! Lower one node given its already-lowered inputs (in `inputs` order). Dispatches over the
-	//! `Operator` oneof. Throws on an unsupported kind.
+	//! Lower one node given its already-lowered inputs (in `inputs` order) and the schema of its first
+	//! input relation (may be null). Dispatches over the `Operator` oneof. Throws on an unsupported kind.
 	unique_ptr<TableRef> LowerNode(const ::delta::kernel::plan::PlanNode &node,
-	                               vector<unique_ptr<TableRef>> inputs);
+	                               vector<unique_ptr<TableRef>> inputs,
+	                               const ::delta::kernel::schema::StructType *input_schema);
+
+	//! The output schema of a node (relation column types), needed to lower identity Transforms and
+	//! the expressions of downstream Project/Filter/etc. Returns null for nodes whose schema we don't
+	//! track (matching the kernel; no Transform is lowered against those). Reads `schemas_` for the
+	//! Filter passthrough, so inputs must already be recorded.
+	const ::delta::kernel::schema::StructType *NodeOutputSchema(const ::delta::kernel::plan::PlanNode &node) const;
 
 	// SSA scratch: output RefId -> the lowered TableRef for that node. Populated in DAG order.
 	std::unordered_map<uint32_t, unique_ptr<TableRef>> lowered_;
+	// SSA scratch: output RefId -> that node's output schema (points into the ResultPlan proto, which
+	// outlives the walk). Used to thread each node's input relation schema into expression lowering.
+	std::unordered_map<uint32_t, const ::delta::kernel::schema::StructType *> schemas_;
 };
 
 } // namespace duckdb

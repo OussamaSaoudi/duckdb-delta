@@ -6,8 +6,26 @@
 // (D1..D7), each replacing its throw with a real lowering. See SDK_IMPLEMENTATION_PLAN.md.
 //===----------------------------------------------------------------------===//
 #include "functions/delta_scan/delta_plan_builder.hpp"
+#include "functions/delta_scan/delta_proto_lower.hpp" // SchemaToDuckDB, LowerPredicate
 
 #include "delta_kernel.hpp" // delta::DeltaError
+
+#include "duckdb/common/types/value.hpp"
+#include "duckdb/parser/expression/cast_expression.hpp"
+#include "duckdb/parser/expression/columnref_expression.hpp"
+#include "duckdb/parser/expression/comparison_expression.hpp"
+#include "duckdb/parser/expression/conjunction_expression.hpp"
+#include "duckdb/parser/expression/constant_expression.hpp"
+#include "duckdb/parser/expression/function_expression.hpp"
+#include "duckdb/parser/expression/star_expression.hpp"
+#include "duckdb/parser/expression/subquery_expression.hpp"
+#include "duckdb/parser/query_node/select_node.hpp"
+#include "duckdb/parser/query_node/set_operation_node.hpp"
+#include "duckdb/parser/statement/select_statement.hpp"
+#include "duckdb/parser/tableref/expressionlistref.hpp"
+#include "duckdb/parser/tableref/joinref.hpp"
+#include "duckdb/parser/tableref/subqueryref.hpp"
+#include "duckdb/parser/tableref/table_function_ref.hpp"
 
 #include <string>
 
@@ -16,6 +34,7 @@ namespace duckdb {
 using ::delta::kernel::plan::Operator;
 using ::delta::kernel::plan::PlanNode;
 using ::delta::kernel::plan::ResultPlan;
+using ::delta::kernel::plan::ScanParquetNode;
 
 namespace {
 
@@ -49,10 +68,535 @@ const char *OpCaseName(Operator::OpCase c) {
 	}
 }
 
+//! Convert a kernel FileMeta location (a URL string) to what read_parquet expects: a filesystem
+//! path for `file://` URLs, or the URL verbatim for object-store schemes (s3://, etc.). Mirrors the
+//! kernel's `url_to_path` in plan_to_sql.rs so the file list matches the SQL path exactly.
+std::string UrlToPath(const std::string &location) {
+	const std::string file_scheme = "file://";
+	if (location.rfind(file_scheme, 0) != 0) {
+		return location; // non-file scheme: read_parquet handles the URL directly
+	}
+	// Strip "file://" and (best-effort) percent-decode %XX escapes back to raw bytes.
+	std::string enc = location.substr(file_scheme.size());
+	std::string out;
+	out.reserve(enc.size());
+	for (size_t i = 0; i < enc.size(); i++) {
+		if (enc[i] == '%' && i + 2 < enc.size()) {
+			auto hex = [](char c) -> int {
+				if (c >= '0' && c <= '9') {
+					return c - '0';
+				}
+				if (c >= 'a' && c <= 'f') {
+					return c - 'a' + 10;
+				}
+				if (c >= 'A' && c <= 'F') {
+					return c - 'A' + 10;
+				}
+				return -1;
+			};
+			int hi = hex(enc[i + 1]);
+			int lo = hex(enc[i + 2]);
+			if (hi >= 0 && lo >= 0) {
+				out.push_back(static_cast<char>((hi << 4) | lo));
+				i += 2;
+				continue;
+			}
+		}
+		out.push_back(enc[i]);
+	}
+	return out;
+}
+
+//! Build `read_parquet([<paths>], union_by_name=true)` as a TableFunctionRef.
+unique_ptr<TableRef> ReadParquetRef(const ScanParquetNode &scan) {
+	// The path list argument: list_value('p0', 'p1', ...).
+	vector<unique_ptr<ParsedExpression>> paths;
+	paths.reserve(scan.files_size());
+	for (int i = 0; i < scan.files_size(); i++) {
+		paths.push_back(make_uniq<ConstantExpression>(Value(UrlToPath(scan.files(i).location()))));
+	}
+	vector<unique_ptr<ParsedExpression>> args;
+	args.push_back(make_uniq<FunctionExpression>("list_value", std::move(paths)));
+	// Named parameter union_by_name=true: a child whose alias is the parameter name (how DuckDB's
+	// table-function binder recognizes named args).
+	auto union_by_name = make_uniq<ConstantExpression>(Value::BOOLEAN(true));
+	union_by_name->SetAlias("union_by_name");
+	args.push_back(std::move(union_by_name));
+
+	auto ref = make_uniq<TableFunctionRef>();
+	ref->function = make_uniq<FunctionExpression>("read_parquet", std::move(args));
+	return ref;
+}
+
+//! Lower a ScanParquet node: a projection that CASTs every action column to its expected schema type
+//! over read_parquet(...), so the row shape matches downstream regardless of the physical parquet
+//! layout. Empty file list => a typed empty relation (SELECT NULL::t AS c, ... WHERE false).
+unique_ptr<TableRef> LowerScanParquet(const ScanParquetNode &scan) {
+	vector<string> names;
+	vector<LogicalType> types;
+	SchemaToDuckDB(scan.schema(), names, types);
+
+	auto select = make_uniq<SelectNode>();
+	const bool empty = scan.files_size() == 0;
+	for (size_t i = 0; i < names.size(); i++) {
+		unique_ptr<ParsedExpression> col;
+		if (empty) {
+			// NULL cast to the column type — a typed placeholder for the empty relation.
+			col = make_uniq<CastExpression>(types[i], make_uniq<ConstantExpression>(Value(types[i])));
+		} else {
+			col = make_uniq<CastExpression>(types[i], make_uniq<ColumnRefExpression>(names[i]));
+		}
+		col->SetAlias(names[i]);
+		select->select_list.push_back(std::move(col));
+	}
+	if (empty) {
+		select->where_clause = make_uniq<ConstantExpression>(Value::BOOLEAN(false));
+	} else {
+		select->from_table = ReadParquetRef(scan);
+	}
+
+	auto stmt = make_uniq<SelectStatement>();
+	stmt->node = std::move(select);
+	return make_uniq<SubqueryRef>(std::move(stmt));
+}
+
+//! Move out input `i` of a node, checking arity so an unexpected plan shape becomes a clean
+//! DeltaError (and the SQL fallback) rather than an out-of-bounds crash.
+unique_ptr<TableRef> TakeInput(const PlanNode &node, vector<unique_ptr<TableRef>> &inputs, size_t i) {
+	if (i >= inputs.size() || !inputs[i]) {
+		throw ::delta::DeltaError("DeltaPlanBuilder: node " + std::to_string(node.output()) + " expects input " +
+		                          std::to_string(i) + " but has " + std::to_string(inputs.size()));
+	}
+	return std::move(inputs[i]);
+}
+
+//! Wrap a SelectNode as a subquery TableRef (the uniform way a node hands its relation to its parent).
+unique_ptr<TableRef> AsSubquery(unique_ptr<SelectNode> select) {
+	auto stmt = make_uniq<SelectStatement>();
+	stmt->node = std::move(select);
+	return make_uniq<SubqueryRef>(std::move(stmt));
+}
+
+//! Lower a Filter node: `SELECT * FROM <input> WHERE <predicate>`.
+unique_ptr<TableRef> LowerFilter(const ::delta::kernel::plan::FilterNode &filter, unique_ptr<TableRef> input,
+                                 const ::delta::kernel::schema::StructType *input_schema) {
+	auto select = make_uniq<SelectNode>();
+	select->select_list.push_back(make_uniq<StarExpression>());
+	select->from_table = std::move(input);
+	select->where_clause = LowerPredicate(filter.predicate(), input_schema);
+	return AsSubquery(std::move(select));
+}
+
+//! Lower a Project node: `SELECT <expr> AS <name>, ... FROM <input>`. Each expression is lowered with
+//! its output-schema field type (drives struct shaping) and the input relation schema (identity
+//! Transforms rename physical→logical field names).
+unique_ptr<TableRef> LowerProject(const ::delta::kernel::plan::ProjectNode &project, unique_ptr<TableRef> input,
+                                  const ::delta::kernel::schema::StructType *input_schema) {
+	const auto *out_schema = project.has_output_schema() ? &project.output_schema() : nullptr;
+	auto select = make_uniq<SelectNode>();
+	for (int i = 0; i < project.named_exprs_size(); i++) {
+		const auto &ne = project.named_exprs(i);
+		const ::delta::kernel::schema::DataType *expected =
+		    (out_schema && i < out_schema->fields_size()) ? &out_schema->fields(i).data_type() : nullptr;
+		auto expr = LowerExpr(ne.expr(), expected, input_schema);
+		expr->SetAlias(ne.name());
+		select->select_list.push_back(std::move(expr));
+	}
+	select->from_table = std::move(input);
+	return AsSubquery(std::move(select));
+}
+
+//! Lower a Values node: a literal relation. `VALUES (r0c0, r0c1, ...), (...)` aliased to the schema
+//! column names; empty rows => a typed empty relation (SELECT NULL::t AS c, ... WHERE false).
+unique_ptr<TableRef> LowerValues(const ::delta::kernel::plan::ValuesNode &values) {
+	vector<string> names;
+	vector<LogicalType> types;
+	SchemaToDuckDB(values.schema(), names, types);
+
+	auto select = make_uniq<SelectNode>();
+	if (values.rows_size() == 0) {
+		for (size_t i = 0; i < names.size(); i++) {
+			auto col = make_uniq<CastExpression>(types[i], make_uniq<ConstantExpression>(Value(types[i])));
+			col->SetAlias(names[i]);
+			select->select_list.push_back(std::move(col));
+		}
+		select->where_clause = make_uniq<ConstantExpression>(Value::BOOLEAN(false));
+		return AsSubquery(std::move(select));
+	}
+
+	// Build an ExpressionListRef (VALUES) and give it the schema's column-name aliases.
+	auto rows_ref = make_uniq<ExpressionListRef>();
+	rows_ref->expected_types = types;
+	rows_ref->expected_names = names;
+	for (int r = 0; r < values.rows_size(); r++) {
+		const auto &row = values.rows(r);
+		vector<unique_ptr<ParsedExpression>> cells;
+		for (int c = 0; c < row.values_size(); c++) {
+			// Cast each literal to the column type so the VALUES relation carries the declared schema.
+			size_t ci = static_cast<size_t>(c);
+			LogicalType t = ci < types.size() ? types[ci] : LogicalType(LogicalType::SQLNULL);
+			cells.push_back(make_uniq<CastExpression>(t, make_uniq<ConstantExpression>(ScalarToValue(row.values(c)))));
+		}
+		rows_ref->values.push_back(std::move(cells));
+	}
+	select->select_list.push_back(make_uniq<StarExpression>());
+	select->from_table = std::move(rows_ref);
+	return AsSubquery(std::move(select));
+}
+
+//! Build `read_json([<paths>], format='newline_delimited', columns={<name>: '<type>', ...})`.
+unique_ptr<TableRef> ReadJsonRef(const ::delta::kernel::plan::ScanJsonNode &scan, const vector<string> &names,
+                                 const vector<LogicalType> &types) {
+	vector<unique_ptr<ParsedExpression>> paths;
+	paths.reserve(scan.files_size());
+	for (int i = 0; i < scan.files_size(); i++) {
+		paths.push_back(make_uniq<ConstantExpression>(Value(UrlToPath(scan.files(i).location()))));
+	}
+	vector<unique_ptr<ParsedExpression>> args;
+	args.push_back(make_uniq<FunctionExpression>("list_value", std::move(paths)));
+
+	auto fmt = make_uniq<ConstantExpression>(Value("newline_delimited"));
+	fmt->SetAlias("format");
+	args.push_back(std::move(fmt));
+
+	// columns={'name': 'TYPE', ...}: a struct whose values are DuckDB type-name strings, matching the
+	// kernel's read_json rendering (each column forced to its schema type).
+	vector<unique_ptr<ParsedExpression>> cols;
+	for (size_t i = 0; i < names.size(); i++) {
+		auto type_str = make_uniq<ConstantExpression>(Value(types[i].ToString()));
+		type_str->SetAlias(names[i]);
+		cols.push_back(std::move(type_str));
+	}
+	auto columns = make_uniq<FunctionExpression>("struct_pack", std::move(cols));
+	columns->SetAlias("columns");
+	args.push_back(std::move(columns));
+
+	auto ref = make_uniq<TableFunctionRef>();
+	ref->function = make_uniq<FunctionExpression>("read_json", std::move(args));
+	return ref;
+}
+
+//! Lower a ScanJson node: `SELECT <cols> FROM read_json(...)` (columns already forced by read_json's
+//! `columns` param). Empty file list => a typed empty relation.
+unique_ptr<TableRef> LowerScanJson(const ::delta::kernel::plan::ScanJsonNode &scan) {
+	vector<string> names;
+	vector<LogicalType> types;
+	SchemaToDuckDB(scan.schema(), names, types);
+
+	auto select = make_uniq<SelectNode>();
+	if (scan.files_size() == 0) {
+		for (size_t i = 0; i < names.size(); i++) {
+			auto col = make_uniq<CastExpression>(types[i], make_uniq<ConstantExpression>(Value(types[i])));
+			col->SetAlias(names[i]);
+			select->select_list.push_back(std::move(col));
+		}
+		select->where_clause = make_uniq<ConstantExpression>(Value::BOOLEAN(false));
+		return AsSubquery(std::move(select));
+	}
+	for (const auto &name : names) {
+		select->select_list.push_back(make_uniq<ColumnRefExpression>(name));
+	}
+	select->from_table = ReadJsonRef(scan, names, types);
+	return AsSubquery(std::move(select));
+}
+
+//! Lower a join key expression, qualifying a bare column reference with the join side's alias
+//! (l_side/r_side) so the ON condition is unambiguous. Non-column keys lower generically (the alias
+//! is resolvable through the aliased subquery side).
+unique_ptr<ParsedExpression> QualifyKey(const ::delta::kernel::expressions::Expression &key, const string &side) {
+	if (key.kind_case() == ::delta::kernel::expressions::Expression::kColumn) {
+		vector<string> path;
+		path.push_back(side);
+		for (const auto &part : key.column().path()) {
+			path.push_back(part);
+		}
+		return make_uniq<ColumnRefExpression>(std::move(path));
+	}
+	return LowerExpr(key);
+}
+
+//! Extract the single top-level name of a kernel ColumnName, or throw (delta_load requires the
+//! path/size/dv/derived columns to be top-level input columns).
+std::string TopLevelName(const ::delta::kernel::expressions::ColumnName &col, const char *what) {
+	if (col.path_size() != 1) {
+		throw ::delta::DeltaError(std::string("DeltaPlanBuilder: ") + what + " must be a top-level column");
+	}
+	return col.path(0);
+}
+
+//! Collect Delta column-mapping field ids (`delta.columnMapping.id`) in DFS pre-order over a struct:
+//! each field's id (or a NULL placeholder), then recurse into struct-typed children. Order matches
+//! the kernel operator's recursive column rename, so ids line up with top-level and nested columns.
+//! Returns false into `any` untouched; sets `any=true` if at least one real id was found.
+void CollectFieldIdsDfs(const ::delta::kernel::schema::StructType &st,
+                        vector<unique_ptr<ParsedExpression>> &out, bool &any) {
+	for (const auto &f : st.fields()) {
+		auto it = f.metadata().find("delta.columnMapping.id");
+		if (it != f.metadata().end() && it->second.value_case() == ::delta::kernel::schema::MetadataValue::kNumber) {
+			out.push_back(make_uniq<ConstantExpression>(Value::BIGINT(it->second.number())));
+			any = true;
+		} else {
+			out.push_back(make_uniq<ConstantExpression>(Value(LogicalType::BIGINT)));
+		}
+		if (f.data_type().kind_case() == ::delta::kernel::schema::DataType::kStruct) {
+			CollectFieldIdsDfs(f.data_type().struct_(), out, any);
+		}
+	}
+}
+
+//! Lower a Load node to the `delta_load` table function over its input relation — the faithful,
+//! generic realization of the kernel Load IR node (opens each file, applies the per-row deletion
+//! vector, broadcasts metadata-derived columns). The input relation is passed as a table-valued
+//! subquery argument, projected to just the columns delta_load reads.
+unique_ptr<TableRef> LowerLoad(const ::delta::kernel::plan::LoadNode &load, unique_ptr<TableRef> input) {
+	using ::delta::kernel::plan::FileType;
+	const std::string path_col = TopLevelName(load.file_meta().path_column(), "delta_load path_column");
+
+	// Project the input to exactly the columns delta_load reads (path, size, rowcount, dv, derived),
+	// so nothing downstream forces reading more and DuckDB can push the projection toward the read.
+	vector<string> input_cols;
+	auto push = [&](const std::string &c) {
+		for (const auto &e : input_cols) {
+			if (e == c) {
+				return;
+			}
+		}
+		input_cols.push_back(c);
+	};
+	push(path_col);
+	if (load.file_meta().has_file_size_column()) {
+		push(TopLevelName(load.file_meta().file_size_column(), "delta_load file_size_column"));
+	}
+	if (load.file_meta().has_num_records_column()) {
+		push(TopLevelName(load.file_meta().num_records_column(), "delta_load num_records_column"));
+	}
+	if (load.has_dv_ref()) {
+		push(TopLevelName(load.dv_ref().column(), "delta_load dv_column"));
+	}
+	for (int i = 0; i < load.metadata_derived_columns_size(); i++) {
+		push(TopLevelName(load.metadata_derived_columns(i), "delta_load metadata_derived"));
+	}
+
+	auto proj = make_uniq<SelectNode>();
+	for (const auto &c : input_cols) {
+		proj->select_list.push_back(make_uniq<ColumnRefExpression>(c));
+	}
+	proj->from_table = std::move(input);
+	auto proj_stmt = make_uniq<SelectStatement>();
+	proj_stmt->node = std::move(proj);
+	auto input_subquery = make_uniq<SubqueryExpression>();
+	input_subquery->subquery_type = SubqueryType::SCALAR;
+	input_subquery->subquery = std::move(proj_stmt);
+
+	// file_schema rendered as a DuckDB STRUCT type string (physical read columns/types).
+	vector<string> fnames;
+	vector<LogicalType> ftypes;
+	SchemaToDuckDB(load.file_schema(), fnames, ftypes);
+	child_list_t<LogicalType> struct_children;
+	for (size_t i = 0; i < fnames.size(); i++) {
+		struct_children.emplace_back(fnames[i], ftypes[i]);
+	}
+	const std::string file_schema_str = LogicalType::STRUCT(std::move(struct_children)).ToString();
+	const char *file_type = load.file_type() == FileType::FILE_TYPE_JSON ? "json" : "parquet";
+
+	vector<unique_ptr<ParsedExpression>> args;
+	args.push_back(std::move(input_subquery));
+	auto named = [&](const string &name, Value v) {
+		auto e = make_uniq<ConstantExpression>(std::move(v));
+		e->SetAlias(name);
+		args.push_back(std::move(e));
+	};
+	named("file_type", Value(std::string(file_type)));
+	named("file_schema", Value(file_schema_str));
+	named("path_column", Value(path_col));
+	if (load.has_base_url()) {
+		named("base_url", Value(load.base_url()));
+	}
+	if (load.has_dv_ref()) {
+		named("dv_column", Value(TopLevelName(load.dv_ref().column(), "delta_load dv_column")));
+		const char *kind = load.dv_ref().kind() == ::delta::kernel::plan::DV_KIND_BYTES ? "bytes" : "descriptor";
+		named("dv_kind", Value(std::string(kind)));
+	}
+	if (load.metadata_derived_columns_size() > 0) {
+		vector<unique_ptr<ParsedExpression>> derived;
+		for (int i = 0; i < load.metadata_derived_columns_size(); i++) {
+			derived.push_back(make_uniq<ConstantExpression>(
+			    Value(TopLevelName(load.metadata_derived_columns(i), "delta_load metadata_derived"))));
+		}
+		auto lst = make_uniq<FunctionExpression>("list_value", std::move(derived));
+		lst->SetAlias("metadata_derived");
+		args.push_back(std::move(lst));
+	}
+	// Column-mapping field ids (top-level AND nested, DFS pre-order) so the read maps by field id.
+	vector<unique_ptr<ParsedExpression>> ids;
+	bool any_ids = false;
+	CollectFieldIdsDfs(load.file_schema(), ids, any_ids);
+	if (any_ids) {
+		auto lst = make_uniq<FunctionExpression>("list_value", std::move(ids));
+		lst->SetAlias("field_ids");
+		args.push_back(std::move(lst));
+	}
+
+	auto ref = make_uniq<TableFunctionRef>();
+	ref->function = make_uniq<FunctionExpression>("delta_load", std::move(args));
+	return ref;
+}
+
+//! Lower a MaxByVersion node: keep the latest row per group via `arg_max(struct_pack(cols), version)`,
+//! then unpack. Matches the kernel's streaming hash-aggregate (no window/sort).
+unique_ptr<TableRef> LowerMaxByVersion(const ::delta::kernel::plan::MaxByVersionNode &mbv,
+                                       unique_ptr<TableRef> input,
+                                       const ::delta::kernel::schema::StructType *input_schema) {
+	vector<string> names;
+	vector<LogicalType> types;
+	SchemaToDuckDB(mbv.output_schema(), names, types);
+
+	// Inner: SELECT arg_max(struct_pack(c := c, ...), <version>) AS __mbv FROM <input> GROUP BY <group_by>
+	auto inner = make_uniq<SelectNode>();
+	vector<unique_ptr<ParsedExpression>> packs;
+	for (const auto &name : names) {
+		auto v = make_uniq<ColumnRefExpression>(name);
+		v->SetAlias(name); // struct_pack(name := name)
+		packs.push_back(std::move(v));
+	}
+	auto packed = make_uniq<FunctionExpression>("struct_pack", std::move(packs));
+	vector<unique_ptr<ParsedExpression>> am_args;
+	am_args.push_back(std::move(packed));
+	am_args.push_back(LowerExpr(mbv.version_column(), nullptr, input_schema));
+	auto arg_max = make_uniq<FunctionExpression>("arg_max", std::move(am_args));
+	arg_max->SetAlias("__mbv");
+	inner->select_list.push_back(std::move(arg_max));
+	inner->from_table = std::move(input);
+	for (int i = 0; i < mbv.group_by_size(); i++) {
+		inner->groups.group_expressions.push_back(LowerExpr(mbv.group_by(i), nullptr, input_schema));
+		inner->groups.grouping_sets.resize(1);
+		inner->groups.grouping_sets[0].insert(static_cast<idx_t>(i));
+	}
+
+	// Outer: SELECT __mbv.c AS c, ... FROM (inner)
+	auto outer = make_uniq<SelectNode>();
+	for (const auto &name : names) {
+		auto access = make_uniq<ColumnRefExpression>(name, "__mbv");
+		access->SetAlias(name);
+		outer->select_list.push_back(std::move(access));
+	}
+	outer->from_table = AsSubquery(std::move(inner));
+	return AsSubquery(std::move(outer));
+}
+
+//! Give a lowered input an alias and wrap it so it can be a named join side. TableRef carries the
+//! alias, but a SubqueryRef is where we can set it uniformly; wrap non-subquery refs in `SELECT *`.
+unique_ptr<TableRef> AliasedSide(unique_ptr<TableRef> input, const string &alias) {
+	auto select = make_uniq<SelectNode>();
+	select->select_list.push_back(make_uniq<StarExpression>());
+	select->from_table = std::move(input);
+	auto sub = AsSubquery(std::move(select));
+	sub->alias = alias;
+	return sub;
+}
+
+//! Lower an EquiJoin (currently only LeftAnti): `SELECT l_side.* FROM <left> l_side ANTI JOIN
+//! <right> r_side ON (l_side.<lkey> IS NOT DISTINCT FROM r_side.<rkey>) AND ...`.
+unique_ptr<TableRef> LowerEquiJoin(const ::delta::kernel::plan::EquiJoinNode &join, unique_ptr<TableRef> left,
+                                   unique_ptr<TableRef> right) {
+	using ::delta::kernel::plan::JoinKind;
+	if (join.kind() != ::delta::kernel::plan::JOIN_KIND_LEFT_ANTI) {
+		throw ::delta::DeltaError("DeltaPlanBuilder: unsupported EquiJoin kind");
+	}
+	if (join.left_keys_size() != join.right_keys_size() || join.left_keys_size() == 0) {
+		throw ::delta::DeltaError("DeltaPlanBuilder: EquiJoin key arity mismatch");
+	}
+
+	auto join_ref = make_uniq<JoinRef>(JoinRefType::REGULAR);
+	join_ref->type = JoinType::ANTI;
+	join_ref->left = AliasedSide(std::move(left), "l_side");
+	join_ref->right = AliasedSide(std::move(right), "r_side");
+
+	// Build the ON condition: AND of (l_side.<lkey> IS NOT DISTINCT FROM r_side.<rkey>). The keys are
+	// expressions over each side; qualify a bare column key with the side alias.
+	unique_ptr<ParsedExpression> cond;
+	for (int i = 0; i < join.left_keys_size(); i++) {
+		auto l = QualifyKey(join.left_keys(i), "l_side");
+		auto r = QualifyKey(join.right_keys(i), "r_side");
+		auto cmp = make_uniq<ComparisonExpression>(ExpressionType::COMPARE_NOT_DISTINCT_FROM, std::move(l),
+		                                           std::move(r));
+		if (!cond) {
+			cond = std::move(cmp);
+		} else {
+			cond = make_uniq<ConjunctionExpression>(ExpressionType::CONJUNCTION_AND, std::move(cond),
+			                                        std::move(cmp));
+		}
+	}
+	join_ref->condition = std::move(cond);
+
+	// SELECT l_side.* FROM (<left> l_side ANTI JOIN <right> r_side ON ...)
+	auto select = make_uniq<SelectNode>();
+	select->select_list.push_back(make_uniq<StarExpression>("l_side"));
+	select->from_table = std::move(join_ref);
+	return AsSubquery(std::move(select));
+}
+
+//! Lower a UnionAll: `SELECT * FROM in0 UNION ALL BY NAME SELECT * FROM in1 ...` as a single N-ary
+//! SetOperationNode (UNION_BY_NAME, ALL). Matches the kernel's `UNION ALL BY NAME`.
+unique_ptr<TableRef> LowerUnionAll(vector<unique_ptr<TableRef>> inputs) {
+	if (inputs.empty()) {
+		throw ::delta::DeltaError("DeltaPlanBuilder: UnionAll with no inputs");
+	}
+	auto make_child = [](unique_ptr<TableRef> in) -> unique_ptr<QueryNode> {
+		auto s = make_uniq<SelectNode>();
+		s->select_list.push_back(make_uniq<StarExpression>());
+		s->from_table = std::move(in);
+		return std::move(s);
+	};
+	if (inputs.size() == 1) {
+		auto stmt = make_uniq<SelectStatement>();
+		stmt->node = make_child(std::move(inputs[0]));
+		return make_uniq<SubqueryRef>(std::move(stmt));
+	}
+	auto setop = make_uniq<SetOperationNode>();
+	setop->setop_type = SetOperationType::UNION_BY_NAME;
+	setop->setop_all = true;
+	for (auto &in : inputs) {
+		setop->children.push_back(make_child(std::move(in)));
+	}
+	auto stmt = make_uniq<SelectStatement>();
+	stmt->node = std::move(setop);
+	return make_uniq<SubqueryRef>(std::move(stmt));
+}
+
 } // namespace
+
+const ::delta::kernel::schema::StructType *DeltaPlanBuilder::NodeOutputSchema(const PlanNode &node) const {
+	const Operator &op = node.op();
+	switch (op.op_case()) {
+	case Operator::kProject:
+		return op.project().has_output_schema() ? &op.project().output_schema() : nullptr;
+	case Operator::kMaxByVersion:
+		return op.max_by_version().has_output_schema() ? &op.max_by_version().output_schema() : nullptr;
+	case Operator::kLoad:
+		return op.load().has_file_schema() ? &op.load().file_schema() : nullptr;
+	case Operator::kValues:
+		return op.values().has_schema() ? &op.values().schema() : nullptr;
+	case Operator::kScanParquet:
+		return op.scan_parquet().has_schema() ? &op.scan_parquet().schema() : nullptr;
+	case Operator::kScanJson:
+		return op.scan_json().has_schema() ? &op.scan_json().schema() : nullptr;
+	case Operator::kFilter: {
+		// Filter passes its input's schema through.
+		if (node.inputs_size() == 0) {
+			return nullptr;
+		}
+		auto it = schemas_.find(node.inputs(0));
+		return it == schemas_.end() ? nullptr : it->second;
+	}
+	default:
+		return nullptr;
+	}
+}
 
 unique_ptr<TableRef> DeltaPlanBuilder::Lower(const ResultPlan &result_plan) {
 	lowered_.clear();
+	schemas_.clear();
 	const auto &plan = result_plan.plan();
 
 	// The IR is topologically ordered: a node's inputs are RefIds strictly less than its own output,
@@ -68,12 +612,24 @@ unique_ptr<TableRef> DeltaPlanBuilder::Lower(const ResultPlan &result_plan) {
 				throw ::delta::DeltaError("DeltaPlanBuilder: input RefId " + std::to_string(input_ref) +
 				                          " of node " + std::to_string(node.output()) + " not yet lowered");
 			}
-			// Move the child out; the SSA DAG uses each output at most... not necessarily once
-			// (a node can be a shared input). For D0 we move; multi-consumer sharing (if it arises)
-			// is handled when a node with fan-out lands. Copy-on-share would go here.
-			inputs.push_back(std::move(it->second));
+			// The IR is a DAG, not a tree: a node can be a shared input to more than one parent
+			// (e.g. the scan reconciliation feeds `commit_dedup` into both a left-anti-join and the
+			// final union). Copy the child subtree for each consumer and keep the original in the map,
+			// so a later consumer of the same RefId still finds it. (The kernel's SQL lowering avoids
+			// duplication by emitting one CTE per node; representing the shared subtree as a CTE here
+			// instead of copying it is a possible future optimization — copying is correct, since the
+			// IR is deterministic dataflow, just potentially redundant for a fanned-out subtree.)
+			inputs.push_back(it->second->Copy());
 		}
-		lowered_[node.output()] = LowerNode(node, std::move(inputs));
+		// The single input relation's schema (if tracked), threaded into expression lowering so a
+		// Transform/Project over it can rename physical→logical field names.
+		const ::delta::kernel::schema::StructType *input_schema = nullptr;
+		if (node.inputs_size() > 0) {
+			auto sit = schemas_.find(node.inputs(0));
+			input_schema = sit == schemas_.end() ? nullptr : sit->second;
+		}
+		lowered_[node.output()] = LowerNode(node, std::move(inputs), input_schema);
+		schemas_[node.output()] = NodeOutputSchema(node);
 	}
 
 	uint32_t result_ref = result_plan.result();
@@ -85,20 +641,31 @@ unique_ptr<TableRef> DeltaPlanBuilder::Lower(const ResultPlan &result_plan) {
 	return std::move(it->second);
 }
 
-unique_ptr<TableRef> DeltaPlanBuilder::LowerNode(const PlanNode &node, vector<unique_ptr<TableRef>> inputs) {
+unique_ptr<TableRef> DeltaPlanBuilder::LowerNode(const PlanNode &node, vector<unique_ptr<TableRef>> inputs,
+                                                 const ::delta::kernel::schema::StructType *input_schema) {
 	const Operator &op = node.op();
 	switch (op.op_case()) {
-	// D1..D7 replace these throws with real lowerings, one node per step.
-	case Operator::kListFiles:
 	case Operator::kScanParquet:
-	case Operator::kScanJson:
+		return LowerScanParquet(op.scan_parquet());
 	case Operator::kValues:
-	case Operator::kProject:
+		return LowerValues(op.values());
 	case Operator::kFilter:
+		return LowerFilter(op.filter(), TakeInput(node, inputs, 0), input_schema);
+	case Operator::kProject:
+		return LowerProject(op.project(), TakeInput(node, inputs, 0), input_schema);
+	case Operator::kScanJson:
+		return LowerScanJson(op.scan_json());
 	case Operator::kLoad:
+		return LowerLoad(op.load(), TakeInput(node, inputs, 0));
 	case Operator::kMaxByVersion:
+		return LowerMaxByVersion(op.max_by_version(), TakeInput(node, inputs, 0), input_schema);
 	case Operator::kEquiJoin:
+		return LowerEquiJoin(op.equi_join(), TakeInput(node, inputs, 0), TakeInput(node, inputs, 1));
 	case Operator::kUnionAll:
+		return LowerUnionAll(std::move(inputs));
+	// ListFiles is a metadata-listing node with no data-plane lowering (resolved by the SM before the
+	// result plan is emitted); it should not appear in a ResultPlan. D7 leaves it throwing.
+	case Operator::kListFiles:
 	case Operator::OP_NOT_SET:
 	default:
 		throw ::delta::DeltaError(std::string("DeltaPlanBuilder: unsupported node: ") +
