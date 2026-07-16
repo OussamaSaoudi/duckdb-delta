@@ -170,6 +170,19 @@ Each NodeKind lowers in isolation given its already-lowered children → each is
 
 ### Sub-steps (each independently validatable; stop after any and the tree still works)
 
+> **STATUS (Phase D COMPLETE — committed `45c87c5`).** D0–D8 + S1/E1/E2 all done. All 10 node
+> kinds and the full Expression/Predicate/Scalar tree lower to a DuckDB unbound `TableRef`; the
+> `delta_plan_builder_test` unit test (a positive case per node + DAG fan-out + error paths) builds
+> and passes green against real DuckDB + proto + FFI. Engine-side files:
+> `src/functions/delta_scan/delta_plan_builder.{hpp,cpp}` (the DAG walk + node lowering) and
+> `delta_proto_lower.{hpp,cpp}` (schema + expression lowering). Two follow-ups surfaced, tracked
+> separately: (a) the proto `LoadNode` is missing a `version` field, so time-travel would regress on
+> cutover — fix in plan.proto + proto_convert + consume here before Phase F; (b) the DAG walk
+> `Copy()`s shared subtrees (correct but potentially redundant for fanned-out nodes) — a CTE-based
+> de-dup is a possible future optimization. Next: **Phase E** wires `Lower` into `delta_scan.cpp`
+> (whole-plan SQL fallback on `DeltaError`), the DeltaSnapshot adapter, the C++11 façade, and the
+> drive-to-completion proof through DuckDB.
+
 - **D0 — the gate.** `DeltaPlanBuilder` skeleton: the DAG walk + `lower_one` dispatch over the
   `Operator` oneof + the `lowered[RefId]` map. Unimplemented arms **throw `DeltaError("unsupported
   node: <kind>")`**. C++17-island TU + a standalone unit test (hand-build a single-node proto →
