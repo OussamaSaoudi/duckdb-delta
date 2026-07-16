@@ -128,6 +128,25 @@ if(TARGET protobuf::protoc)
 else()
   set(PROTOC_BIN "${Protobuf_PROTOC_EXECUTABLE}")
 endif()
+
+# The RAW protobuf + abseil archive files (not the imported `protobuf::libprotobuf` target). The
+# imported target carries INTERFACE_COMPILE_FEATURES "cxx_std_17", which propagates through ANY link
+# edge — even $<LINK_ONLY> — and would force the whole c++11 extension to c++17, reintroducing the
+# LogicalType ODR abort against the c++11-built libduckdb. Linking the .a files directly gives the
+# symbols the c++17 island objects reference WITHOUT imposing any compile feature on the extension.
+# Wrapped in --start-group/--end-group so the protobuf<->abseil circular refs resolve regardless of
+# order. Used by the shipping extension; the island OBJECT lib still uses the imported target (it is
+# already c++17, so the feature is harmless there and its usage-requirements are objects-only).
+# vcpkg's lib dir (same path the OPENSSL hints above use): the installed triplet's lib/.
+set(_VCPKG_LIB_DIR "${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/lib")
+file(GLOB _ABSL_ARCHIVES "${_VCPKG_LIB_DIR}/libabsl_*.a")
+set(DELTA_PROTO_LINK_ARCHIVES
+    -Wl,--start-group
+    "${_VCPKG_LIB_DIR}/libprotobuf.a"
+    "${_VCPKG_LIB_DIR}/libutf8_range.a"
+    "${_VCPKG_LIB_DIR}/libutf8_validity.a"
+    ${_ABSL_ARCHIVES}
+    -Wl,--end-group)
 # Feed the kernel's C++ proto codegen (ffi/build.rs) the vcpkg protoc.
 set(RUST_ENV_VARS ${RUST_ENV_VARS} PROTOC=${PROTOC_BIN})
 
@@ -270,6 +289,44 @@ set_target_properties(delta_proto PROPERTIES POSITION_INDEPENDENT_CODE ON
                                              CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
 include_directories("${DELTA_PROTO_CPP_DIR}")
 
+# Phase E — the C++17 IR-scan island, folded into the shipping extension.
+#
+# delta_scan_ir is a STATIC library compiling the proto-consuming TUs (DeltaPlanBuilder, the
+# schema/expression lowering, and the delta_scan_ir facade) at c++17, plus the generated proto
+# objects. The C++11 extension links it and calls ONLY the non-proto facade in delta_scan_ir.hpp
+# (BuildDeltaScanRef -> unique_ptr<TableRef>); no proto/pb.h enters the C++11 TUs.
+#
+# CRITICAL (the ODR boundary): this is an OBJECT library at c++17, consumed by the extension via
+# $<TARGET_OBJECTS:delta_scan_ir> (its compiled objects are added to the extension's own sources).
+# OBJECT-object injection pulls ONLY the compiled objects — NOT the target's INTERFACE compile-
+# features — so the extension's c++11 TUs stay c++11 even though these objects were built at c++17.
+# (A STATIC lib on target_link_libraries would instead require the extension's install(EXPORT) set to
+# also export it, and risks propagating protobuf's required-cxx_std_17 INTERFACE feature onto the
+# extension — the LogicalType::VARCHAR ODR abort.) protobuf is linked into the extension separately
+# below (its archive members, not its c++17 feature). The delta_plan_builder_test already proved these
+# c++17 objects link + run correctly against c++11-built duckdb (LogicalType/Value/TableRef).
+set(DELTA_IR_SOURCES
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/functions/delta_scan/delta_plan_builder.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/functions/delta_scan/delta_proto_lower.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/functions/delta_scan/delta_scan_ir.cpp)
+add_library(delta_scan_ir OBJECT ${DELTA_IR_SOURCES})
+add_dependencies(delta_scan_ir delta_kernel delta_proto)
+target_include_directories(
+  delta_scan_ir
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/include
+          ${CMAKE_SOURCE_DIR}/src/include
+          "${DELTA_PROTO_CPP_DIR}"
+          "${CMAKE_BINARY_DIR}/codegen/include")
+# The island consumes the engine's patched FFI header name (delta_kernel.hpp -> generated_...).
+target_compile_definitions(delta_scan_ir PRIVATE DELTA_KERNEL_FFI_HEADER="generated_delta_kernel_ffi.hpp")
+# Pull protobuf's INTERFACE usage requirements (include dirs, and harmlessly its cxx_std_17 — this
+# target is already c++17). This is PRIVATE and, crucially, delta_scan_ir is consumed by the extension
+# via $<TARGET_OBJECTS:> (objects only), so none of these requirements reach the c++11 extension TUs.
+# The libprotobuf archive itself is linked onto the extension target below for the referenced symbols.
+target_link_libraries(delta_scan_ir PRIVATE protobuf::libprotobuf)
+set_target_properties(delta_scan_ir PROPERTIES POSITION_INDEPENDENT_CODE ON
+                                               CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+
 # Stage-0 round-trip baseline: a standalone C++17 executable that serialize/parses a ResultPlan using
 # the kernel-generated structs. Proves the codegen compiles, links its matching libprotobuf, and
 # preserves structure. Isolated from the C++11 extension (see scope note below). Built only when the
@@ -326,8 +383,10 @@ endif()
 # that exposes only a non-protobuf C++ surface to the c++11 extension TUs). For Stage 0 the round-trip
 # is a standalone harness (see proto_roundtrip below), and the shipping extension stays untouched/green.
 
-build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
-build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
+# The c++17 IR-scan island objects are compiled into the extension here (see the delta_scan_ir ODR
+# note): OBJECT-object injection adds the compiled objects without the c++17 compile feature.
+build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES} $<TARGET_OBJECTS:delta_scan_ir>)
+build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES} $<TARGET_OBJECTS:delta_scan_ir>)
 
 # The generated FFI header is copied to codegen/include/ and patched at build
 # time (see scripts/ffi/{prefix,suffix}.inc; inline_msvc_compat.inc is generated dynamically).
@@ -342,14 +401,19 @@ set(CMAKE_OSX_DEPLOYMENT_TARGET
 # Add the default client
 add_compile_definitions(DEFINE_DEFAULT_ENGINE DEFINE_DEFAULT_ENGINE_BASE)
 
-# Link delta-kernal-rs to static lib. (protobuf is intentionally NOT linked here in Stage 0 — see
-# the delta_proto scope note above; that would force the extension to c++17 and break ODR.)
-target_link_libraries(${EXTENSION_NAME} ${DELTA_KERNEL_LIBPATH} ${PLATFORM_LIBS})
-add_dependencies(${EXTENSION_NAME} delta_kernel)
+# Link delta-kernal-rs to static lib. The c++17 IR-scan island rides in as OBJECTS (added to
+# EXTENSION_SOURCES via $<TARGET_OBJECTS:delta_scan_ir> at build_*_extension above), so there's no
+# library to export; we link the RAW protobuf+abseil ARCHIVES (DELTA_PROTO_LINK_ARCHIVES, not the
+# imported target) for the proto symbols those objects reference — the raw .a files carry no
+# cxx_std_17 INTERFACE feature, so the extension's own TUs stay c++11 (no LogicalType ODR abort).
+target_link_libraries(${EXTENSION_NAME} ${DELTA_KERNEL_LIBPATH}
+                      ${DELTA_PROTO_LINK_ARCHIVES} ${PLATFORM_LIBS})
+add_dependencies(${EXTENSION_NAME} delta_kernel delta_scan_ir)
 
 # Link delta-kernal-rs to dynamic lib
-target_link_libraries(${LOADABLE_EXTENSION_NAME} ${DELTA_KERNEL_LIBPATH} ${PLATFORM_LIBS})
-add_dependencies(${LOADABLE_EXTENSION_NAME} delta_kernel)
+target_link_libraries(${LOADABLE_EXTENSION_NAME} ${DELTA_KERNEL_LIBPATH}
+                      ${DELTA_PROTO_LINK_ARCHIVES} ${PLATFORM_LIBS})
+add_dependencies(${LOADABLE_EXTENSION_NAME} delta_kernel delta_scan_ir)
 
 install(
   TARGETS ${EXTENSION_NAME}
