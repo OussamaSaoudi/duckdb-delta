@@ -384,9 +384,16 @@ endif()
 # is a standalone harness (see proto_roundtrip below), and the shipping extension stays untouched/green.
 
 # The c++17 IR-scan island objects are compiled into the extension here (see the delta_scan_ir ODR
-# note): OBJECT-object injection adds the compiled objects without the c++17 compile feature.
-build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES} $<TARGET_OBJECTS:delta_scan_ir>)
-build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES} $<TARGET_OBJECTS:delta_scan_ir>)
+# note): OBJECT-object injection adds the compiled objects without the c++17 compile feature. We add
+# BOTH the island objects (delta_scan_ir) AND the generated proto message objects (delta_proto, the
+# .pb.cc) — the island references the proto message classes (ResultPlan/Plan/..., their
+# CopyFrom/default-instance/ctor), so those definitions must be in the same archive. Without the
+# delta_proto objects the static extension archive links into libduckdb.so with undefined proto
+# symbols (a .so tolerates them; the static libduckdb link does not).
+build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES}
+                       $<TARGET_OBJECTS:delta_scan_ir> $<TARGET_OBJECTS:delta_proto>)
+build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES}
+                         $<TARGET_OBJECTS:delta_scan_ir> $<TARGET_OBJECTS:delta_proto>)
 
 # The generated FFI header is copied to codegen/include/ and patched at build
 # time (see scripts/ffi/{prefix,suffix}.inc; inline_msvc_compat.inc is generated dynamically).

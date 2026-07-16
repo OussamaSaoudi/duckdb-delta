@@ -149,14 +149,25 @@ unique_ptr<TableRef> BuildDeltaScanRef(const string &path, int64_t version, Delt
 		predicate = &visitor;
 	}
 
+	// Optional diagnostics: set DELTA_SCAN_IR_TRACE=1 to log which path served each scan (IR vs SQL
+	// fallback). Off by default; used to verify E3 wiring in dev.
+	const bool trace = std::getenv("DELTA_SCAN_IR_TRACE") != nullptr;
 	try {
 		auto ref = BuildViaIR(path, version, kind, predicate, context);
 		if (visitor.error_data.HasError()) {
 			throw IOException("delta_scan: predicate translation failed for '%s': %s", path,
 			                  visitor.error_data.Message());
 		}
+		if (trace) {
+			fprintf(stderr, "[delta_scan_ir] IR path served '%s' (kind=%s)\n", path.c_str(),
+			        kind == DeltaScanIRKind::Metadata ? "metadata" : "data");
+		}
 		return ref;
-	} catch (const delta::DeltaError &) {
+	} catch (const delta::DeltaError &e) {
+		if (trace) {
+			fprintf(stderr, "[delta_scan_ir] SQL FALLBACK for '%s' (kind=%s): %s\n", path.c_str(),
+			        kind == DeltaScanIRKind::Metadata ? "metadata" : "data", e.what());
+		}
 		// A node the IR path can't lower yet — fall back to the SQL path for the whole scan (still a
 		// TableRef). Phase F removes this catch once all NodeKinds are covered.
 		auto ref = BuildViaSql(path, version, kind, predicate, context);
