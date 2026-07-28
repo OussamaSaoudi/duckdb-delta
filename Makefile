@@ -15,11 +15,11 @@ ifneq ("${CUSTOM_LINKER}", "")
 endif
 
 # Set test paths
-test_release: export DELTA_KERNEL_TESTS_PATH=./build/release/rust/src/delta_kernel/kernel/tests/data
-test_release: export DAT_PATH=./build/release/rust/src/delta_kernel/acceptance/tests/dat
+test_release: export DELTA_KERNEL_TESTS_PATH=${PROJ_DIR}vendor/delta-kernel-rs/kernel/tests/data
+test_release: export DAT_PATH=${PROJ_DIR}vendor/delta-kernel-rs/acceptance/tests/dat
 
-test_debug: export DELTA_KERNEL_TESTS_PATH=./build/debug/rust/src/delta_kernel/kernel/tests/data
-test_debug: export DAT_PATH=./build/debug/rust/src/delta_kernel/acceptance/tests/dat
+test_debug: export DELTA_KERNEL_TESTS_PATH=${PROJ_DIR}vendor/delta-kernel-rs/kernel/tests/data
+test_debug: export DAT_PATH=${PROJ_DIR}vendor/delta-kernel-rs/acceptance/tests/dat
 
 # Core extensions that we need for crucial testing
 DEFAULT_TEST_EXTENSION_DEPS=tpcds;tpch;json;

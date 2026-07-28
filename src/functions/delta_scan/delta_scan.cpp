@@ -19,7 +19,6 @@
 #include "duckdb/common/string_util.hpp"
 #include "functions/delta_scan/delta_multi_file_list.hpp"
 #include "functions/delta_scan/delta_scan_ir.hpp" // BuildDeltaScanRef (proto-IR path facade)
-#include "functions/delta_scan/sm_sdk.hpp"
 
 namespace duckdb {
 
@@ -107,18 +106,19 @@ static unique_ptr<LogicalOperator> DeltaScanBindOperator(ClientContext &context,
 	// then wrap it in the custom logical operator.
 	vector<LogicalType> return_types;
 	auto bind_data = table_function.bind(context, input, return_types, return_names);
-	// The reconciliation subplan feeds the file list from PhysicalDeltaLoad's streaming sink instead of a
-	// bind/plan-time synchronous kernel scan. Mark it streaming NOW (at bind) so any bind/plan-time
+	// The reconciliation subplan feeds the file list from PhysicalDeltaLoad's build sink instead of a
+	// bind/plan-time synchronous kernel scan. Mark it build-populated NOW (at bind) so any bind/plan-time
 	// GetCardinality / GetTotalFileCount serves the (empty) resolved_files directly instead of triggering
 	// the synchronous kernel scan — leaving the reconciliation to the attached subplan.
 	auto &mf_bind_data = bind_data->Cast<MultiFileBindData>();
-	mf_bind_data.file_list->Cast<DeltaMultiFileList>().MarkStreamingPopulated();
+	mf_bind_data.file_list->Cast<DeltaMultiFileList>().MarkBuildPopulated();
 	virtual_column_map_t virtual_columns;
 	if (table_function.get_virtual_columns) {
 		virtual_columns = table_function.get_virtual_columns(context, bind_data.get());
 	}
 	auto op = make_uniq<LogicalDeltaGet>(bind_index, table_function, std::move(bind_data), std::move(return_types),
 	                                     return_names, std::move(virtual_columns), input.inputs, input.named_parameters);
+	BindDeltaReconciliationChild(*op, context, input.binder.get());
 
 	return std::move(op);
 }
@@ -127,7 +127,8 @@ static unique_ptr<LogicalOperator> DeltaScanBindOperator(ClientContext &context,
 // kernel's metadata-only scan SM and returns the surviving-file list (path, size, deletionVector,
 // fileConstantValues), with no data read. Lets you exercise/benchmark the metadata phase on tables
 // whose data files aren't reachable. Same driver, metadata_only=true.
-static unique_ptr<TableRef> DeltaScanMetadataBindReplace(ClientContext &context, TableFunctionBindInput &input) {
+static unique_ptr<TableRef> DeltaScanIRBindReplace(ClientContext &context, TableFunctionBindInput &input,
+                                                   DeltaScanIRKind kind) {
 	if (input.inputs.empty()) {
 		return nullptr;
 	}
@@ -139,9 +140,21 @@ static unique_ptr<TableRef> DeltaScanMetadataBindReplace(ClientContext &context,
 			scan_version = (v < 0) ? -1 : v;
 		}
 	}
-	// Lower the metadata-only scan via the proto-IR path (DeltaPlanBuilder), falling back to the SQL
-	// path inside the facade if a node isn't lowerable yet. No pushdown filters at this TVF.
-	return BuildDeltaScanRef(table_path, scan_version, DeltaScanIRKind::Metadata, {}, nullptr, context);
+	// Lower the selected scan via the protobuf IR path. These bind-replacement probes have no pushed
+	// filter; production delta_scan obtains its predicate through the optimizer extension.
+	return BuildDeltaScanRef(table_path, scan_version, kind, {}, nullptr, context);
+}
+
+static unique_ptr<TableRef> DeltaScanMetadataBindReplace(ClientContext &context, TableFunctionBindInput &input) {
+	return DeltaScanIRBindReplace(context, input, DeltaScanIRKind::Metadata);
+}
+
+// Full terminal ResultPlan probe. This deliberately exposes the kernel's ScanKind::Data path while
+// the production delta_scan remains on the proven metadata-child + native reader path. It is the
+// end-to-end cutover gate: once corpus/filter parity is established here, delta_scan can select this
+// path and the temporary function can be removed.
+static unique_ptr<TableRef> DeltaScanDataIRBindReplace(ClientContext &context, TableFunctionBindInput &input) {
+	return DeltaScanIRBindReplace(context, input, DeltaScanIRKind::Data);
 }
 
 // in_out stub for delta_load: never executed (bind_operator routes the call to PhysicalDeltaLoad,
@@ -152,9 +165,9 @@ static OperatorResultType DeltaLoadInOutStub(ExecutionContext &, TableFunctionIn
 }
 
 // Build a faithful-Load read column from a resolved file_schema type, recursively. The column carries
-// the PHYSICAL name (from file_schema, which plan_to_sql already emits as the physical/columnMapping name)
+// the PHYSICAL name (from file_schema, emitted as the physical/columnMapping name)
 // and, when column mapping is enabled, an INTEGER Delta field-id identifier consumed from `field_ids` in
-// DFS pre-order (the order plan_to_sql emits them) — top-level AND nested — so the parquet read maps every
+// DFS pre-order — top-level AND nested — so the parquet read maps every
 // level by field id and emits physical names (the kernel's terminal Transform renames physical->logical).
 // `fid_idx` advances across the whole subtree. STRUCT children recurse; LIST/MAP elements are left as-is
 // (the Transform passes those through without renaming their elements). For non-column-mapping tables
@@ -188,7 +201,7 @@ static DeltaMultiFileColumnDefinition BuildLoadColumn(const string &name, const 
 // schema), field_ids (column-mapping identifiers), base_url, file_type, metadata_derived — so we build the
 // read schema directly and hand a pre-populated DeltaMultiFileList to the multi-file bind (injected via a
 // fresh DeltaFunctionInfo so CreateFileList returns it). The file list is then driven by PhysicalDeltaLoad's
-// streaming sink, not by a kernel scan.
+// build sink, not by a kernel scan.
 static unique_ptr<LogicalOperator> DeltaLoadBindOperator(ClientContext &context, TableFunctionBindInput &input,
                                                          idx_t bind_index, vector<string> &return_names) {
 	auto &table_function = input.table_function;
@@ -223,7 +236,7 @@ static unique_ptr<LogicalOperator> DeltaLoadBindOperator(ClientContext &context,
 	}
 
 	// Build the read schema directly from file_schema (NO snapshot). These names are already the physical
-	// (columnMapping) names that plan_to_sql emitted; field_ids carry the Delta column-mapping ids for the
+	// (columnMapping) names emitted by the plan; field_ids carry the Delta column-mapping ids for the
 	// by-field-id parquet read.
 	auto lp = file_schema_str.find('(');
 	auto rp = file_schema_str.rfind(')');
@@ -258,6 +271,7 @@ static unique_ptr<LogicalOperator> DeltaLoadBindOperator(ClientContext &context,
 	// The output schema mirrors the read schema; we will append metadata_derived (broadcast) columns to
 	// both the bind output and the provided schema below.
 	vector<LogicalType> return_types;
+	vector<string> metadata_derived_names;
 	return_names.clear();
 	for (auto &col : provided_columns) {
 		return_names.push_back(col.name);
@@ -276,6 +290,7 @@ static unique_ptr<LogicalOperator> DeltaLoadBindOperator(ClientContext &context,
 		}
 		for (auto &mv : ListValue::GetChildren(kv.second)) {
 			string mname = mv.GetValue<string>();
+			metadata_derived_names.push_back(mname);
 			LogicalType mtype = LogicalType::VARCHAR;
 			bool found = false;
 			for (idx_t c = 0; c < input.input_table_names.size(); c++) {
@@ -302,7 +317,7 @@ static unique_ptr<LogicalOperator> DeltaLoadBindOperator(ClientContext &context,
 	// base_url is the path prefix every file resolves against (BuildFileEntry resolves against GetPath()).
 	auto provided_list = make_shared_ptr<DeltaMultiFileList>(context, base_url, DConstants::INVALID_INDEX);
 	provided_list->SetProvidedSchema(provided_columns, /*partition_cols=*/{});
-	provided_list->MarkStreamingPopulated();
+	provided_list->MarkBuildPopulated();
 
 	auto load_info = make_shared_ptr<DeltaFunctionInfo>();
 	load_info->snapshot = provided_list;
@@ -379,7 +394,8 @@ static unique_ptr<LogicalOperator> DeltaLoadBindOperator(ClientContext &context,
 	}
 
 	auto op = make_uniq<LogicalDeltaGet>(bind_index, inner_function, std::move(bind_data), return_types, return_names,
-	                                     std::move(virtual_columns), input.inputs, input.named_parameters);
+	                                     std::move(virtual_columns), input.inputs, input.named_parameters,
+	                                     /* is_load= */ true);
 	// Find the scan_file_row columns in the (binder-attached) input relation's schema, by name.
 	for (idx_t c = 0; c < input.input_table_names.size(); c++) {
 		const auto &nm = input.input_table_names[c];
@@ -389,6 +405,14 @@ static unique_ptr<LogicalOperator> DeltaLoadBindOperator(ClientContext &context,
 			op->build_fcv_col = c;
 		} else if (nm == "deletionVector") {
 			op->build_dv_col = c;
+		}
+	}
+	for (const auto &name : metadata_derived_names) {
+		for (idx_t c = 0; c < input.input_table_names.size(); c++) {
+			if (input.input_table_names[c] == name) {
+				op->build_metadata_cols.emplace_back(name, c);
+				break;
+			}
 		}
 	}
 	if (op->build_path_col == DConstants::INVALID_INDEX) {
@@ -518,6 +542,16 @@ TableFunctionSet DeltaFunctions::GetDeltaScanMetadataFunction(ExtensionLoader &l
 	}
 	parquet_scan_copy.name = "delta_scan_metadata";
 	return parquet_scan_copy;
+}
+
+TableFunctionSet DeltaFunctions::GetDeltaScanDataIRFunction(ExtensionLoader &loader) {
+	auto result = GetDeltaScanMetadataFunction(loader);
+	result.name = "delta_scan_data_ir";
+	for (auto &function : result.functions) {
+		function.name = "delta_scan_data_ir";
+		function.bind_replace = DeltaScanDataIRBindReplace;
+	}
+	return result;
 }
 
 } // namespace duckdb

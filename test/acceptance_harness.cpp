@@ -425,9 +425,11 @@ Outcome RunSpec(Connection &con, const Spec &s, std::string &err_msg) {
 } // namespace
 
 int main(int argc, char **argv) {
-	std::string workloads = ExpandHome("~/delta-kernel-rs/acceptance/workloads");
-	std::string classification_path = ExpandHome("~/duckdb/duckdb-delta/test/acceptance_classification.json");
-	std::string extension_path = ExpandHome("~/duckdb/duckdb-delta/build/release/extension/delta/delta.duckdb_extension");
+	// The harness is normally launched from the repository root. All defaults stay inside the
+	// checkout; command-line overrides remain available for external workload corpora.
+	std::string workloads = "vendor/delta-kernel-rs/acceptance/workloads";
+	std::string classification_path = "test/acceptance_classification.json";
+	std::string extension_path = "build/release/extension/delta/delta.duckdb_extension";
 	std::string filter;
 	int concurrency = 0; // 0 = sequential
 	bool verbose_pass = false;

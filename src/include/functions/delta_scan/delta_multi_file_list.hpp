@@ -106,31 +106,33 @@ public:
 	//! the deletionVector struct or NULL. The (expensive) deletion-vector resolution happens here, so
 	//! the build sink can run it lock-free across many threads. Returns an entry with an empty
 	//! `file.path` when `path_val` is NULL (caller skips it).
-	ResolvedFileEntry BuildFileEntry(const Value &path_val, const Value &fcv_val, const Value &dv_val) const;
+	ResolvedFileEntry BuildFileEntry(const Value &path_val, const Value &fcv_val, const Value &dv_val,
+	                                 const vector<pair<string, Value>> &metadata_values = {}) const;
 	//! Append a batch of pre-built entries to the shared list under a single lock (one lock per build
 	//! thread, not per row), assigning each its file_number.
 	void AppendResolvedEntries(vector<ResolvedFileEntry> &&entries);
 	//! Mark the build-pipeline-fed file list complete; the source side then serves resolved_files
 	//! directly (no lazy nested-query path, no kernel iterator) and, since the list is now immutable,
-	//! lock-free. Also sets the listing closed and wakes any source blocked at the list tail.
+	//! lock-free.
 	void MarkExternallyPopulated();
 
-	//! Streaming-sink mode (concurrent sink+source PhysicalDeltaLoad): the sink appends resolved
-	//! entries via AppendResolvedEntries WHILE the source scans, instead of fully building before the
-	//! source runs. Enables the GetFileInternal "serve resolved_files directly" path before the list is
-	//! closed, and makes the list report itself as not-yet-finalized so the source BLOCKs (rather than
-	//! finishing) when it catches up to the tail.
-	void MarkStreamingPopulated();
-	//! True once MarkStreamingPopulated ran: this list is fed by PhysicalDeltaLoad's sink (delta_load
+	//! Mark a list as owned by a PhysicalDeltaLoad build pipeline. This prevents planning/cardinality
+	//! probes from falling back to the synchronous kernel iterator before the build child executes.
+	void MarkBuildPopulated();
+	//! Start a fresh execution of a barriered PhysicalDeltaLoad. Physical plans can be executed more
+	//! than once by DuckDB's verifier/prepared-statement machinery; descriptors from a prior run must
+	//! not be retained or the next run scans duplicate files.
+	void ResetBuildExecution();
+	//! True once MarkBuildPopulated ran: this list is fed by PhysicalDeltaLoad's sink (delta_load
 	//! TVF). In this mode the reader must output the *physical* read schema (field-id mapped) — the
 	//! kernel's terminal Transform does the physical->logical rename — so InitializeReader must NOT
 	//! override the bound (physical) global columns with the snapshot's logical lazy_loaded_schema.
-	bool IsStreamingPopulated() const {
-		return streaming_populated;
+	bool IsBuildPopulated() const {
+		return build_populated;
 	}
 
 	//! Faithful Load (delta_load TVF): supply the read schema explicitly instead of resolving it from a
-	//! kernel snapshot. The lowering (plan_to_sql) passes `file_schema`(+`field_ids`) and `base_url` as
+	//! kernel snapshot. Plan lowering passes `file_schema`(+`field_ids`) and `base_url` as
 	//! named params, so a Load over an arbitrary file set (commit/checkpoint/sidecar/data) never needs a
 	//! Delta snapshot. `columns` are the physical read columns (names from file_schema, INTEGER field-id
 	//! identifiers from field_ids) plus the appended metadata_derived broadcast columns. `partition_cols`
@@ -138,12 +140,6 @@ public:
 	//! the broadcast fileConstantValues by the terminal Transform). When set, Bind /
 	//! GetLazyLoadedGlobalColumns / GetPartitionColumns return these WITHOUT initializing any snapshot.
 	void SetProvidedSchema(vector<DeltaMultiFileColumnDefinition> columns, vector<string> partition_cols);
-	//! Register the source operator's blockable global state so the sink can wake it on append/close.
-	//! Called once at source initialization. Set to null to clear.
-	void SetBlockedSourceState(StateWithBlockableTasks *state);
-	//! MultiFileList API: the streaming list is final only once the sink's Finalize has closed it.
-	bool IsFinalizedListing() const override;
-
 	vector<DeltaMultiFileColumnDefinition> &GetLazyLoadedGlobalColumns() const;
 	vector<NestedNotNullConstraint> GetNestedNotNullConstraints() const;
 	bool HasNullConstraintsInArrays() const;
@@ -159,19 +155,8 @@ protected:
 	void InitializeScan() const;
 
 public:
-	//! Lower the kernel's metadata-only scan SM to the file-list reconciliation SQL — WITH the
-	//! pushed-down `table_filters` threaded in as the kernel's
-	//! data-skipping predicate, so the emitted SQL contains the stats-based file-skip FILTER (over
-	//! `add.stats_parsed`). This does NOT execute the SQL: the optimizer parses+binds it into a VISIBLE
-	//! child subplan of the delta_scan operator (READ_JSON/UNION/arg_max/FILTER... appear in EXPLAIN), and
-	//! PhysicalDeltaLoad's streaming sink populates the file list from that subplan's rows. No lock required
-	//! (reads only the immutable-after-bind GetPath()/version/global_columns/table_filters).
-	string BuildReconciliationSQL(ClientContext &context) const;
-
-	//! The proto-IR analogue of BuildReconciliationSQL: lower the metadata-only scan (with the same
-	//! pushed-down predicate) to a DuckDB unbound TableRef via DeltaPlanBuilder (SQL fallback inside the
-	//! facade). The optimizer binds this TableRef into the same visible child subplan. Same immutable
-	//! reads, no lock.
+	//! Lower the metadata-only scan (with the pushed-down predicate) to a DuckDB unbound TableRef via
+	//! the protobuf DeltaPlanBuilder. The optimizer binds it into a visible child subplan.
 	unique_ptr<TableRef> BuildReconciliationRef(ClientContext &context) const;
 
 	void EnsureSnapshotInitialized() const;
@@ -219,25 +204,14 @@ protected:
 	mutable bool initialized_scan = false;
 	mutable bool files_exhausted = false;
 	//! Set once the file list for this list has been fully populated (by MarkExternallyPopulated).
-	mutable bool plan_sql_done = false;
+	mutable bool external_population_done = false;
 
 	//! Set when the file list was populated externally by the C′ build pipeline (PhysicalDeltaScan's
 	//! sink). GetFileInternal then serves resolved_files directly.
 	mutable bool externally_populated = false;
 
-	//! Streaming sink+source mode: the sink appends to resolved_files concurrently with the source
-	//! scanning. GetFileInternal serves resolved_files directly (like externally_populated) but the
-	//! list is NOT immutable/closed until streaming_closed.
-	mutable bool streaming_populated = false;
-	//! Set by the sink's Finalize: no more files will be appended. Until then IsFinalizedListing()
-	//! reports false so a source that catches up to the tail BLOCKs instead of finishing.
-	mutable atomic<bool> streaming_closed {false};
-	//! The source operator's blockable global state, registered once at source init, woken by the sink
-	//! on each append and on close. Guarded by `lock` for set/clear; wake takes the state's own lock.
-	mutable StateWithBlockableTasks *blocked_source_state = nullptr;
-	//! Wake the registered source (if any) — takes the source state's own lock. Lock-order: callers
-	//! must NOT hold `lock` while calling this (avoids inversion with the source-state lock).
-	void WakeBlockedSource() const;
+	//! Set while a build pipeline owns population of this list. The source runs only after Finalize.
+	mutable bool build_populated = false;
 
 	//! Metadata map for files
 	mutable vector<unique_ptr<DeltaFileMetaData>> metadata;

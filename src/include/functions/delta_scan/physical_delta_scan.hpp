@@ -39,11 +39,18 @@
 namespace duckdb {
 
 class DBConfig;
+class Binder;
+struct LogicalDeltaGet;
 
 //! Register the delta_scan optimizer extension. It restores filter pushdown for the custom-operator
 //! path (LogicalDeltaGet is invisible to DuckDB's FilterPushdown), so delta_scan prunes files (data
 //! skipping) like the standard path, and attaches the reconciliation subplan.
 void RegisterDeltaScanOptimizer(DBConfig &config);
+
+//! Bind (or replace) the metadata-reconciliation child for a public delta_scan operator.
+//! The baseline child is installed during bind so DuckDB's unoptimized verifier path is valid;
+//! the optimizer replaces it after pushing a data-skipping predicate into the file list.
+void BindDeltaReconciliationChild(LogicalDeltaGet &op, ClientContext &context, Binder *parent_binder);
 
 //! Data-stage scan source operator. Subclasses PhysicalTableScan so the entire
 //! parallel multi-file scan machinery (GetGlobalSourceState / GetLocalSourceState
@@ -86,22 +93,16 @@ public:
 
 	void BuildPipelines(Pipeline &current, MetaPipeline &meta_pipeline) override;
 
-	//===--------------------------------------------------------------------===//
-	// Streaming source: the data scan runs concurrently with the sink (no build-before-probe barrier).
-	// GetGlobalSourceState registers the source's blockable state with the DeltaMultiFileList so the
-	// sink can wake it; GetDataInternal converts the multi-file source's transient catch-up (no file
-	// yet, list not closed) into SourceResultType::BLOCKED instead of FINISHED.
-	//===--------------------------------------------------------------------===//
-	unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &context) const override;
-	SourceResultType GetDataInternal(ExecutionContext &context, DataChunk &chunk,
-	                                 OperatorSourceInput &input) const override;
-
 	//! Column positions of path / fileConstantValues / deletionVector in the build subplan's output
 	//! (the scan_file_row shape). Set in CreatePlan from the bound child's output names. The sink reads
 	//! these columns out of each build chunk and ingests them into the DeltaMultiFileList.
 	idx_t build_path_col = DConstants::INVALID_INDEX;
 	idx_t build_fcv_col = DConstants::INVALID_INDEX;
 	idx_t build_dv_col = DConstants::INVALID_INDEX;
+	//! All LoadNode metadata_derived columns and their positions in the build input. Unlike the
+	//! three structural columns above, this is deliberately generic (commit Loads broadcast
+	//! `version`, while data Loads broadcast `path` and `fileConstantValues`).
+	vector<pair<string, idx_t>> build_metadata_cols;
 };
 
 //! LogicalExtensionOperator returned by delta_scan's bind_operator. Holds the
@@ -110,11 +111,11 @@ struct LogicalDeltaGet : public LogicalExtensionOperator {
 	LogicalDeltaGet(idx_t bind_index, TableFunction function, unique_ptr<FunctionData> bind_data,
 	                vector<LogicalType> returned_types, vector<string> returned_names,
 	                virtual_column_map_t virtual_columns, vector<Value> parameters,
-	                named_parameter_map_t named_parameters)
+	                named_parameter_map_t named_parameters, bool is_load = false)
 	    : bind_index(bind_index), function(std::move(function)), bind_data(std::move(bind_data)),
 	      returned_types(std::move(returned_types)), returned_names(std::move(returned_names)),
 	      virtual_columns(std::move(virtual_columns)), parameters(std::move(parameters)),
-	      named_parameters(std::move(named_parameters)) {
+	      named_parameters(std::move(named_parameters)), is_load(is_load) {
 		types = this->returned_types;
 	}
 
@@ -124,19 +125,39 @@ struct LogicalDeltaGet : public LogicalExtensionOperator {
 	vector<LogicalType> returned_types;
 	vector<string> returned_names;
 	virtual_column_map_t virtual_columns;
+	vector<ColumnIndex> column_ids;
 	vector<Value> parameters;
 	named_parameter_map_t named_parameters;
+	bool is_load;
 
 	//! Build subplan (metadata reconciliation) output column positions, set in bind_operator.
 	idx_t build_path_col = DConstants::INVALID_INDEX;
 	idx_t build_fcv_col = DConstants::INVALID_INDEX;
 	idx_t build_dv_col = DConstants::INVALID_INDEX;
+	vector<pair<string, idx_t>> build_metadata_cols;
 
 	PhysicalOperator &CreatePlan(ClientContext &context, PhysicalPlanGenerator &planner) override;
 
 	void ResolveTypes() override {
-		types = returned_types;
-		// delta_load: the streaming-input child (the scan_file_row relation, e.g. n7) is attached by the
+		if (column_ids.empty()) {
+			// Initial bind_operator validation happens before the binder has populated projection IDs.
+			types = returned_types;
+		} else {
+			types.clear();
+			for (const auto &column_id : column_ids) {
+				if (column_id.IsVirtualColumn()) {
+					auto entry = virtual_columns.find(column_id.GetPrimaryIndex());
+					if (entry == virtual_columns.end()) {
+						throw InternalException("delta_scan: unknown virtual column id %d",
+						                        column_id.GetPrimaryIndex());
+					}
+					types.push_back(entry->second.type);
+				} else {
+					types.push_back(returned_types[column_id.GetPrimaryIndex()]);
+				}
+			}
+		}
+		// delta_load: the build-input child (the scan_file_row relation, e.g. n7) is attached by the
 		// binder AFTER bind_operator returns, so we cannot declare our column dependency there. Do it
 		// here (ResolveTypes runs on the full bound tree before optimization): reference every child
 		// column so RemoveUnusedColumns keeps the path/fileConstantValues/deletionVector columns the
@@ -157,7 +178,15 @@ struct LogicalDeltaGet : public LogicalExtensionOperator {
 	}
 
 	vector<ColumnBinding> GetColumnBindings() override {
-		return GenerateColumnBindings(bind_index, returned_types.size());
+		return GenerateColumnBindings(bind_index, column_ids.empty() ? 1 : column_ids.size());
+	}
+
+	optional_ptr<vector<ColumnIndex>> GetTableFunctionColumnIds() override {
+		return &column_ids;
+	}
+
+	optional_ptr<virtual_column_map_t> GetTableFunctionVirtualColumns() override {
+		return &virtual_columns;
 	}
 
 	string GetExtensionName() const override {

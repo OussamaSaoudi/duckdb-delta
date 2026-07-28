@@ -1,10 +1,10 @@
 [submodule "duckdb"]
 	path = duckdb
 	# Fork: carries the core-DuckDB changes the plan-based scan depends on (BY_FIELD_ID_OR_NAME
-	# column mapping, table-arg child on LOGICAL_EXTENSION_OPERATOR, streaming sink+source). The
-	# pinned submodule commit lives on this fork's prototype/duckdb-plan-based-scan branch.
+	# column mapping and virtual-column support for bind_operator scans). The
+	# pinned submodule commit lives on this fork's plan-based-scan-streaming-load branch.
 	url = https://github.com/OussamaSaoudi/duckdb
-	branch = prototype/duckdb-plan-based-scan
+	branch = plan-based-scan-streaming-load
 [submodule "extension-ci-tools"]
 	path = extension-ci-tools
 	url = https://github.com/duckdb/extension-ci-tools.git

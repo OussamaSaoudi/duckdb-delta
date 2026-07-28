@@ -3,7 +3,7 @@
 //
 // D0 is the gate: the SSA-DAG walk + dispatch over the Operator oneof, with every NodeKind arm
 // throwing `delta::DeltaError("unsupported node: ...")`. Coverage fills in one node per step
-// (D1..D7), each replacing its throw with a real lowering. See SDK_IMPLEMENTATION_PLAN.md.
+// Each supported kernel IR node lowers directly to DuckDB parser objects.
 //===----------------------------------------------------------------------===//
 #include "functions/delta_scan/delta_plan_builder.hpp"
 #include "functions/delta_scan/delta_proto_lower.hpp" // SchemaToDuckDB, LowerPredicate
@@ -25,6 +25,7 @@
 #include "duckdb/parser/query_node/set_operation_node.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/tableref/expressionlistref.hpp"
+#include "duckdb/parser/tableref/emptytableref.hpp"
 #include "duckdb/parser/tableref/joinref.hpp"
 #include "duckdb/parser/tableref/subqueryref.hpp"
 #include "duckdb/parser/tableref/table_function_ref.hpp"
@@ -85,7 +86,7 @@ const char *OpCaseName(Operator::OpCase c) {
 
 //! Convert a kernel FileMeta location (a URL string) to what read_parquet expects: a filesystem
 //! path for `file://` URLs, or the URL verbatim for object-store schemes (s3://, etc.). Mirrors the
-//! kernel's `url_to_path` in plan_to_sql.rs so the file list matches the SQL path exactly.
+//! kernel URL normalization so local file lists use DuckDB-compatible paths.
 std::string UrlToPath(const std::string &location) {
 	const std::string file_scheme = "file://";
 	if (location.rfind(file_scheme, 0) != 0) {
@@ -122,8 +123,12 @@ std::string UrlToPath(const std::string &location) {
 	return out;
 }
 
-//! Build `read_parquet([<paths>], union_by_name=true)` as a TableFunctionRef.
-unique_ptr<TableRef> ReadParquetRef(const ScanParquetNode &scan) {
+//! Build `read_parquet([<paths>], schema=<declared schema>)` as a TableFunctionRef.
+//! The explicit schema is important for Delta checkpoints: action columns added by newer protocol
+//! versions are legitimately absent from older checkpoint files, but the kernel plan declares them
+//! and expects NULL values. DuckDB's Parquet schema option provides exactly those typed defaults.
+unique_ptr<TableRef> ReadParquetRef(const ScanParquetNode &scan, const vector<string> &names,
+                                    const vector<LogicalType> &types) {
 	// The path list argument: list_value('p0', 'p1', ...).
 	vector<unique_ptr<ParsedExpression>> paths;
 	paths.reserve(scan.files_size());
@@ -132,11 +137,25 @@ unique_ptr<TableRef> ReadParquetRef(const ScanParquetNode &scan) {
 	}
 	vector<unique_ptr<ParsedExpression>> args;
 	args.push_back(make_uniq<FunctionExpression>("list_value", std::move(paths)));
-	// Named parameter union_by_name=true: a child whose alias is the parameter name (how DuckDB's
-	// table-function binder recognizes named args).
-	auto union_by_name = make_uniq<ConstantExpression>(Value::BOOLEAN(true));
-	union_by_name->SetAlias("union_by_name");
-	args.push_back(std::move(union_by_name));
+	if (!names.empty()) {
+		vector<Value> schema_keys;
+		vector<Value> schema_values;
+		schema_keys.reserve(names.size());
+		schema_values.reserve(names.size());
+		for (idx_t i = 0; i < names.size(); i++) {
+			schema_keys.emplace_back(names[i]);
+			schema_values.push_back(Value::STRUCT({{"name", Value(names[i])},
+			                                       {"type", Value(types[i].ToString())},
+			                                       {"default_value", Value(LogicalType::VARCHAR)}}));
+		}
+		// Capture this before moving schema_values. Passing schema_values[0].type() and
+		// std::move(schema_values) as arguments to the same call is order-dependent in C++17.
+		auto schema_value_type = schema_values[0].type();
+		auto schema = make_uniq<ConstantExpression>(Value::MAP(LogicalType::VARCHAR, schema_value_type,
+		                                                       std::move(schema_keys), std::move(schema_values)));
+		schema->SetAlias("schema");
+		args.push_back(std::move(schema));
+	}
 
 	auto ref = make_uniq<TableFunctionRef>();
 	ref->function = make_uniq<FunctionExpression>("read_parquet", std::move(args));
@@ -154,21 +173,28 @@ unique_ptr<TableRef> LowerScanParquet(const ScanParquetNode &scan) {
 
 	auto select = make_uniq<SelectNode>();
 	const bool empty = scan.files_size() == 0;
+	auto source = empty ? nullptr : ReadParquetRef(scan, names, types);
+	const auto source_alias = source ? source->alias : string();
 	for (size_t i = 0; i < names.size(); i++) {
 		unique_ptr<ParsedExpression> col;
 		if (empty) {
 			// NULL cast to the column type — a typed placeholder for the empty relation.
 			col = make_uniq<CastExpression>(types[i], make_uniq<ConstantExpression>(Value(types[i])));
 		} else {
-			col = make_uniq<CastExpression>(types[i], make_uniq<ColumnRefExpression>(names[i]));
+			// Qualify the input column. Without this, a projection such as
+			// CAST(domainMetadata AS ...) AS domainMetadata is bound as a reference to its
+			// own SELECT-list alias when reading a checkpoint with that column, which DuckDB
+			// rejects as an alias self-reference.
+			col = make_uniq<CastExpression>(types[i], make_uniq<ColumnRefExpression>(names[i], source_alias));
 		}
 		col->SetAlias(names[i]);
 		select->select_list.push_back(std::move(col));
 	}
 	if (empty) {
 		select->where_clause = make_uniq<ConstantExpression>(Value::BOOLEAN(false));
+		select->from_table = make_uniq<EmptyTableRef>();
 	} else {
-		select->from_table = ReadParquetRef(scan);
+		select->from_table = std::move(source);
 	}
 
 	auto stmt = make_uniq<SelectStatement>();
@@ -177,7 +203,7 @@ unique_ptr<TableRef> LowerScanParquet(const ScanParquetNode &scan) {
 }
 
 //! Move out input `i` of a node, checking arity so an unexpected plan shape becomes a clean
-//! DeltaError (and the SQL fallback) rather than an out-of-bounds crash.
+//! DeltaError rather than an out-of-bounds crash.
 unique_ptr<TableRef> TakeInput(const PlanNode &node, vector<unique_ptr<TableRef>> &inputs, size_t i) {
 	if (i >= inputs.size() || !inputs[i]) {
 		throw ::delta::DeltaError("DeltaPlanBuilder: node " + std::to_string(node.output()) + " expects input " +
@@ -190,7 +216,7 @@ unique_ptr<TableRef> TakeInput(const PlanNode &node, vector<unique_ptr<TableRef>
 //! must be aliased: DuckDB's star expansion (`SELECT *` over the subquery) qualifies each expanded
 //! column with the subquery's binding alias, and an unset alias trips
 //! `BindingAlias::GetAlias on a non-set alias` (INTERNAL Error) when the plan nests subqueries. The
-//! SQL path never hit this because the SQL parser auto-aliases every subquery; hand-built TableRefs do
+//! Hand-built TableRefs require explicit aliases for qualified column references.
 //! not, so we stamp a unique alias here. Counter is per-process; only uniqueness + non-empty matter.
 unique_ptr<TableRef> MakeAliasedSubquery(unique_ptr<SelectStatement> stmt) {
 	static std::atomic<uint64_t> counter {0};
@@ -250,6 +276,7 @@ unique_ptr<TableRef> LowerValues(const ::delta::kernel::plan::ValuesNode &values
 			select->select_list.push_back(std::move(col));
 		}
 		select->where_clause = make_uniq<ConstantExpression>(Value::BOOLEAN(false));
+		select->from_table = make_uniq<EmptyTableRef>();
 		return AsSubquery(std::move(select));
 	}
 
@@ -327,6 +354,7 @@ unique_ptr<TableRef> LowerScanJson(const ::delta::kernel::plan::ScanJsonNode &sc
 			select->select_list.push_back(std::move(col));
 		}
 		select->where_clause = make_uniq<ConstantExpression>(Value::BOOLEAN(false));
+		select->from_table = make_uniq<EmptyTableRef>();
 		return AsSubquery(std::move(select));
 	}
 	for (const auto &name : names) {
@@ -601,6 +629,38 @@ unique_ptr<TableRef> LowerUnionAll(vector<unique_ptr<TableRef>> inputs) {
 	return MakeAliasedSubquery(std::move(stmt));
 }
 
+//! Compute the actual relation schema produced by Load: physical file columns followed by every
+//! metadata-derived column copied from the descriptor input. The proto stores only file_schema, so
+//! the engine must synthesize this shape before lowering the terminal Project/Transform.
+unique_ptr<::delta::kernel::schema::StructType> LoadOutputSchema(
+    const ::delta::kernel::plan::LoadNode &load,
+    const ::delta::kernel::schema::StructType *input_schema) {
+	auto output = make_uniq<::delta::kernel::schema::StructType>();
+	output->CopyFrom(load.file_schema());
+	if (load.metadata_derived_columns_size() == 0) {
+		return output;
+	}
+	if (!input_schema) {
+		throw ::delta::DeltaError("DeltaPlanBuilder: Load metadata-derived columns require an input schema");
+	}
+	for (const auto &column : load.metadata_derived_columns()) {
+		const std::string name = TopLevelName(column, "delta_load metadata_derived");
+		const ::delta::kernel::schema::StructField *found = nullptr;
+		for (const auto &field : input_schema->fields()) {
+			if (field.name() == name) {
+				found = &field;
+				break;
+			}
+		}
+		if (!found) {
+			throw ::delta::DeltaError("DeltaPlanBuilder: Load metadata-derived column '" + name +
+			                          "' is absent from its input schema");
+		}
+		output->add_fields()->CopyFrom(*found);
+	}
+	return output;
+}
+
 } // namespace
 
 const ::delta::kernel::schema::StructType *DeltaPlanBuilder::NodeOutputSchema(const PlanNode &node) const {
@@ -611,7 +671,8 @@ const ::delta::kernel::schema::StructType *DeltaPlanBuilder::NodeOutputSchema(co
 	case Operator::kMaxByVersion:
 		return op.max_by_version().has_output_schema() ? &op.max_by_version().output_schema() : nullptr;
 	case Operator::kLoad:
-		return op.load().has_file_schema() ? &op.load().file_schema() : nullptr;
+		// Synthesized during Lower(); see LoadOutputSchema.
+		return nullptr;
 	case Operator::kValues:
 		return op.values().has_schema() ? &op.values().schema() : nullptr;
 	case Operator::kScanParquet:
@@ -634,6 +695,7 @@ const ::delta::kernel::schema::StructType *DeltaPlanBuilder::NodeOutputSchema(co
 unique_ptr<TableRef> DeltaPlanBuilder::Lower(const ResultPlan &result_plan) {
 	lowered_.clear();
 	schemas_.clear();
+	owned_schemas_.clear();
 	const auto &plan = result_plan.plan();
 
 	// The IR is topologically ordered: a node's inputs are RefIds strictly less than its own output,
@@ -666,7 +728,13 @@ unique_ptr<TableRef> DeltaPlanBuilder::Lower(const ResultPlan &result_plan) {
 			input_schema = sit == schemas_.end() ? nullptr : sit->second;
 		}
 		lowered_[node.output()] = LowerNode(node, std::move(inputs), input_schema);
-		schemas_[node.output()] = NodeOutputSchema(node);
+		if (node.op().op_case() == Operator::kLoad) {
+			auto schema = LoadOutputSchema(node.op().load(), input_schema);
+			schemas_[node.output()] = schema.get();
+			owned_schemas_[node.output()] = std::move(schema);
+		} else {
+			schemas_[node.output()] = NodeOutputSchema(node);
+		}
 	}
 
 	uint32_t result_ref = result_plan.result();

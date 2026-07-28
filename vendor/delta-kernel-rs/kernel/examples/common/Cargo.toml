@@ -1,0 +1,26 @@
+[package]
+name = "common"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+version.workspace = true
+
+# for cargo-release
+[package.metadata.release]
+release = false
+
+[features]
+default = ["arrow"]
+arrow = ["arrow-58"]
+arrow-58 = ["delta_kernel/arrow-58"]
+arrow-57 = ["delta_kernel/arrow-57"]
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+delta_kernel = { path = "../../../kernel", features = [
+  "default-engine-rustls",
+  "internal-api",
+] }
+tracing = { version = "0.1", features = ["log"] }
+url = "2"

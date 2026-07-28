@@ -7,7 +7,7 @@
 #   output_dir      — directory to write patched header and generated inc file into
 #
 # Copies and patches the delta-kernel FFI C++ header, updating the src from
-# - build/<kind>/rust/src/delta-kernel-rs/target/ffi/delta_kernel_ffi.hpp
+# - build/<kind>/rust/local-target/delta_kernel_ffi.hpp
 # - build/<kind>/codegen/include/generated_delta_kernel_ffi.hpp
 #
 # Patches applied (see cbindgen#402 for MSVC context):

@@ -9,6 +9,7 @@ vector<TableFunctionSet> DeltaFunctions::GetTableFunctions(ExtensionLoader &load
 
 	functions.push_back(GetDeltaScanFunction(loader));
 	functions.push_back(GetDeltaScanMetadataFunction(loader));
+	functions.push_back(GetDeltaScanDataIRFunction(loader));
 	functions.push_back(GetDeltaLoadFunction(loader));
 	functions.push_back(GetDeltaFileListFunction(loader));
 	functions.push_back(GetDeltaDomainMetadataFunction(loader));

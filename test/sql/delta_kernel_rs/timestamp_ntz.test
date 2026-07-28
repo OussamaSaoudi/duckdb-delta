@@ -4,6 +4,8 @@
 
 require parquet
 
+require json
+
 require delta
 
 require-env DELTA_KERNEL_TESTS_PATH

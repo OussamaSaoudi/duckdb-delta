@@ -4,6 +4,36 @@ This is the DuckDB extension for [Delta](https://delta.io/), built using the
 [Delta Kernel](https://github.com/delta-incubator/delta-kernel-rs). The extension offers read and limited write (blind insert) support for delta
 tables, both local and remote.
 
+## Build from source
+
+The repository includes the matching Delta Kernel source and pins its DuckDB dependencies. A fresh
+checkout needs only:
+
+```shell
+git clone --recurse-submodules <repository-url> duckdb-delta
+cd duckdb-delta
+./scripts/bootstrap.sh debug
+```
+
+The resulting CLI is `build/debug/duckdb`. Use `release` instead of `debug` for an optimized build.
+If the repository was cloned without `--recurse-submodules`, the bootstrap script initializes them.
+
+Launch it directly and scan a table:
+
+```shell
+./build/debug/duckdb
+```
+
+```sql
+SELECT * FROM delta_scan('/path/to/delta-table');
+```
+
+For a ready-made tour of partitioning, deletion vectors, metadata scans, and data skipping, run:
+
+```shell
+./build/debug/duckdb -unsigned -init demo_delta_shapes.sql
+```
+
 ## Supported platforms
 
 The supported platforms are:
@@ -119,8 +149,7 @@ make generate-data
 GENERATED_DATA_AVAILABLE=1 make test
 ```
 
-# Updating delta-kernel-rs / FFI version
+# Updating delta-kernel-rs / FFI
 
-Simply update the `GIT_TAG` definition found in `./CMakeLists.txt` and (re-)run
-`make clean <debug|release>`. The FFI header is included directly from the
-cargo build, and any breakage from the update should show up immediately.
+Update `vendor/delta-kernel-rs` as one source change and rebuild. The FFI header and compiled C++ SDK
+are generated directly from the vendored tree, so incompatible changes fail in the same build.

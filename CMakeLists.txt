@@ -160,6 +160,26 @@ set(RUST_UNSET_ENV_VARS --unset=CC --unset=CXX --unset=LD)
 set(DELTA_KERNEL_LIBNAME
     "${CMAKE_STATIC_LIBRARY_PREFIX}delta_kernel_ffi${CMAKE_STATIC_LIBRARY_SUFFIX}"
 )
+
+# Delta Kernel is vendored so a checkout is reproducible without cloning a matching development
+# branch from another repository. Kernel developers can still point this at a separate worktree.
+set(DELTA_KERNEL_SOURCE_DIR
+    "${CMAKE_CURRENT_SOURCE_DIR}/vendor/delta-kernel-rs"
+    CACHE PATH "delta-kernel-rs source tree")
+if(NOT EXISTS "${DELTA_KERNEL_SOURCE_DIR}/Cargo.toml")
+  message(FATAL_ERROR
+          "Delta Kernel source is missing at ${DELTA_KERNEL_SOURCE_DIR}. "
+          "Use a complete checkout or set -DDELTA_KERNEL_SOURCE_DIR=<path>.")
+endif()
+message(STATUS "Using delta-kernel-rs: ${DELTA_KERNEL_SOURCE_DIR}")
+set(DELTA_KERNEL_TARGET_DIR "${CMAKE_BINARY_DIR}/rust/local-target")
+# ffi/build.rs treats an explicit CARGO_TARGET_DIR itself as the header output directory.
+set(DELTA_KERNEL_FFI_HEADER_ROOT "${DELTA_KERNEL_TARGET_DIR}")
+set(DELTA_KERNEL_SOURCE_ARGS SOURCE_DIR "${DELTA_KERNEL_SOURCE_DIR}" DOWNLOAD_COMMAND "")
+# ExternalProject does not track source files. Always invoke Cargo so edits cannot leave DuckDB
+# linked against a stale kernel archive (Cargo itself remains incremental).
+set(DELTA_KERNEL_BUILD_ALWAYS 1)
+set(RUST_ENV_VARS ${RUST_ENV_VARS} CARGO_TARGET_DIR=${DELTA_KERNEL_TARGET_DIR})
 # Cargo's output subdir as a PLAIN configure-time string (not a generator expression). It feeds
 # ExternalProject_Add's BUILD_BYPRODUCTS below, and CMake 3.16's ExternalProject rejects a
 # generator expression there ("BYPRODUCTS containing a <"). CMAKE_BUILD_TYPE is known at configure
@@ -170,18 +190,18 @@ else()
   set(CARGO_BUILD_SUBDIR "release")
 endif()
 set(DELTA_KERNEL_LIBPATH
-    "${CMAKE_BINARY_DIR}/rust/src/delta_kernel/target/${RUST_PLATFORM_TARGET}/${CARGO_BUILD_SUBDIR}/${DELTA_KERNEL_LIBNAME}"
+    "${DELTA_KERNEL_TARGET_DIR}/${RUST_PLATFORM_TARGET}/${CARGO_BUILD_SUBDIR}/${DELTA_KERNEL_LIBNAME}"
 )
 set(DELTA_KERNEL_FFI_HEADER_PATH
-    "${CMAKE_BINARY_DIR}/rust/src/delta_kernel/target/ffi-headers")
+    "${DELTA_KERNEL_FFI_HEADER_ROOT}")
 # Dir where the kernel build.rs emits the generated C++ proto structs (declared as ExternalProject
 # byproducts below, compiled into the extension). Defined here so the byproduct paths resolve.
 set(DELTA_PROTO_CPP_DIR "${DELTA_KERNEL_FFI_HEADER_PATH}/proto-cpp")
 set(DELTA_KERNEL_FFI_HEADER_C
-    "${CMAKE_BINARY_DIR}/rust/src/delta_kernel/target/ffi-headers/delta_kernel_ffi.h"
+    "${DELTA_KERNEL_FFI_HEADER_PATH}/delta_kernel_ffi.h"
 )
 set(DELTA_KERNEL_FFI_HEADER_CXX
-    "${CMAKE_BINARY_DIR}/rust/src/delta_kernel/target/ffi-headers/delta_kernel_ffi.hpp"
+    "${DELTA_KERNEL_FFI_HEADER_PATH}/delta_kernel_ffi.hpp"
 )
 
 set(DELTA_KERNEL_FFI_HEADER_PATCHED
@@ -194,13 +214,13 @@ set(CARGO_PROFILE "$<IF:$<CONFIG:Debug>,dev,release>")
 # Add rust_example as a CMake target
 ExternalProject_Add(
   ${KERNEL_NAME}
-  GIT_REPOSITORY "https://github.com/OussamaSaoudi/delta-kernel-rs"
-  GIT_TAG prototype/duckdb-plan-based-scan
+  ${DELTA_KERNEL_SOURCE_ARGS}
   # Prints the env variables passed to the cargo build to the terminal, useful
   # in debugging because passing them through CMake is an error-prone mess
   CONFIGURE_COMMAND ${CMAKE_COMMAND} -E env ${RUST_UNSET_ENV_VARS}
                     ${RUST_ENV_VARS} env
   UPDATE_COMMAND ""
+  BUILD_ALWAYS ${DELTA_KERNEL_BUILD_ALWAYS}
   BUILD_IN_SOURCE 1
   # Build debug build
   BUILD_COMMAND
@@ -221,14 +241,7 @@ ExternalProject_Add(
       ${CMAKE_CURRENT_SOURCE_DIR}/scripts/ffi
       ${DELTA_KERNEL_FFI_HEADER_CXX}
       ${CMAKE_BINARY_DIR}/codegen/include
-  # Also place the kernel-shipped RAII SDK header next to the patched FFI header on the include path.
-  # It includes the FFI header via DELTA_KERNEL_SDK_FFI_HEADER (the engine sets that to the patched
-  # generated_delta_kernel_ffi.hpp name), so it must live in the same dir.
-  COMMAND
-    ${CMAKE_COMMAND} -E copy_if_different
-      ${DELTA_KERNEL_FFI_HEADER_PATH}/delta_kernel_sdk.hpp
-      ${CMAKE_BINARY_DIR}/codegen/include/delta_kernel_sdk.hpp
-  # And the new proto-IR C++ API header (delta_kernel.hpp, Phase C). Same rationale: it includes the
+  # Place the protobuf-only C++ API header on the generated include path. It includes the
   # FFI header via DELTA_KERNEL_FFI_HEADER (the DeltaPlanBuilder island sets that to the patched
   # generated_delta_kernel_ffi.hpp name), plus plan.pb.h/schema.pb.h from the proto-cpp dir.
   COMMAND
@@ -245,6 +258,7 @@ ExternalProject_Add(
     "${DELTA_KERNEL_LIBPATH}"
     "${DELTA_KERNEL_FFI_HEADER_C}"
     "${DELTA_KERNEL_FFI_HEADER_CXX}"
+    "${DELTA_KERNEL_FFI_HEADER_PATH}/delta_kernel.cpp"
     "${DELTA_PROTO_CPP_DIR}/plan.pb.cc"
     "${DELTA_PROTO_CPP_DIR}/expressions.pb.cc"
     "${DELTA_PROTO_CPP_DIR}/schema.pb.cc"
@@ -306,6 +320,7 @@ include_directories("${DELTA_PROTO_CPP_DIR}")
 # below (its archive members, not its c++17 feature). The delta_plan_builder_test already proved these
 # c++17 objects link + run correctly against c++11-built duckdb (LogicalType/Value/TableRef).
 set(DELTA_IR_SOURCES
+    ${DELTA_KERNEL_FFI_HEADER_PATH}/delta_kernel.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/functions/delta_scan/delta_plan_builder.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/functions/delta_scan/delta_proto_lower.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/functions/delta_scan/delta_scan_ir.cpp)

@@ -2,7 +2,6 @@
 #include "functions/delta_scan/delta_multi_file_list.hpp"
 #include "functions/delta_scan/delta_multi_file_reader.hpp"
 #include "functions/delta_scan/delta_scan_ir.hpp" // BuildDeltaScanRef (proto-IR path facade)
-#include "functions/delta_scan/sm_sdk.hpp"
 
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database.hpp"
@@ -675,9 +674,11 @@ void DeltaMultiFileList::Bind(vector<LogicalType> &return_types, vector<string> 
 // per-file work: resolve the path against the table root, broadcast the metadata-derived columns
 // (partition values from fileConstantValues), and resolve the deletion vector (dv_ref). All inputs
 // it reads (GetPath()/root/version) are immutable after bind, so many build threads can call this
-// concurrently — including the expensive kdf_resolve_dv — with no contention.
+// concurrently — including deletion-vector resolution — with no contention.
 DeltaMultiFileList::ResolvedFileEntry DeltaMultiFileList::BuildFileEntry(const Value &path_val, const Value &fcv_val,
-                                                                        const Value &dv_val) const {
+                                                                        const Value &dv_val,
+                                                                        const vector<pair<string, Value>>
+                                                                            &metadata_values) const {
 	ResolvedFileEntry entry;
 	if (path_val.IsNull()) {
 		return entry; // empty file.path -> caller skips
@@ -706,6 +707,9 @@ DeltaMultiFileList::ResolvedFileEntry DeltaMultiFileList::BuildFileEntry(const V
 	}
 	if (!path_val.IsNull()) {
 		entry.meta->partition_map["path"] = path_val;
+	}
+	for (const auto &metadata : metadata_values) {
+		entry.meta->partition_map[metadata.first] = metadata.second;
 	}
 
 	// Inject partition values from fileConstantValues.partitionValues_parsed into the file's
@@ -761,13 +765,13 @@ DeltaMultiFileList::ResolvedFileEntry DeltaMultiFileList::BuildFileEntry(const V
 			char *dverr = nullptr;
 			const string &root = paths[0].path;
 			ffi::KernelBoolSlice sv =
-			    ffi::kdf_resolve_dv(root.c_str(), root.size(), storage_type.c_str(), storage_type.size(),
+			    ffi::delta_resolve_dv(root.c_str(), root.size(), storage_type.c_str(), storage_type.size(),
 			                        path_or_inline.c_str(), path_or_inline.size(), has_offset, offset, size_in_bytes,
 			                        cardinality, &dverr);
 			if (dverr) {
 				string msg(dverr);
-				ffi::kdf_string_free(dverr);
-				throw IOException("Plan-SQL delta scan: deletion-vector resolution failed: %s", msg);
+				ffi::delta_string_free(dverr);
+				throw IOException("Delta plan scan: deletion-vector resolution failed: %s", msg);
 			}
 			if (sv.ptr) {
 				entry.meta->selection_vector = sv;
@@ -778,74 +782,47 @@ DeltaMultiFileList::ResolvedFileEntry DeltaMultiFileList::BuildFileEntry(const V
 }
 
 void DeltaMultiFileList::AppendResolvedEntries(vector<ResolvedFileEntry> &&entries) {
-	{
-		unique_lock<mutex> lck(lock);
-		for (auto &entry : entries) {
-			if (entry.file.path.empty()) {
-				continue;
-			}
-			entry.meta->file_number = resolved_files.size();
-			resolved_files.push_back(std::move(entry.file));
-			metadata.push_back(std::move(entry.meta));
+	unique_lock<mutex> lck(lock);
+	for (auto &entry : entries) {
+		if (entry.file.path.empty()) {
+			continue;
 		}
+		entry.meta->file_number = resolved_files.size();
+		resolved_files.push_back(std::move(entry.file));
+		metadata.push_back(std::move(entry.meta));
 	}
-	// Wake a source blocked at the tail — new files are now available. Done outside `lock`: the wake
-	// takes the source-state's own lock, and holding both in opposite orders would invert.
-	WakeBlockedSource();
 }
 
 void DeltaMultiFileList::MarkExternallyPopulated() {
 	{
 		unique_lock<mutex> lck(lock);
 		externally_populated = true;
-		plan_sql_done = true;
+		external_population_done = true;
 		files_exhausted = true;
-		streaming_closed = true;
 	}
-	// Final wake: the listing is now closed. A blocked source resumes, sees no more files + closed, and
-	// finishes. Guarantees no permanent hang even if an earlier append-wake was missed.
-	WakeBlockedSource();
 }
 
-void DeltaMultiFileList::MarkStreamingPopulated() {
+void DeltaMultiFileList::MarkBuildPopulated() {
 	unique_lock<mutex> lck(lock);
-	streaming_populated = true;
+	build_populated = true;
 }
 
-bool DeltaMultiFileList::IsFinalizedListing() const {
-	// In streaming mode the listing is final only once the sink closed it. Otherwise (legacy kernel /
-	// fully-materialized paths) it is always final — a Scan miss is true EOF.
-	if (streaming_populated) {
-		return streaming_closed.load();
-	}
-	return true;
-}
-
-void DeltaMultiFileList::SetBlockedSourceState(StateWithBlockableTasks *state) {
+void DeltaMultiFileList::ResetBuildExecution() {
 	unique_lock<mutex> lck(lock);
-	blocked_source_state = state;
-}
-
-void DeltaMultiFileList::WakeBlockedSource() const {
-	StateWithBlockableTasks *state;
-	{
-		unique_lock<mutex> lck(lock);
-		state = blocked_source_state;
-	}
-	if (state) {
-		auto guard = state->Lock();
-		state->UnblockTasks(guard);
-	}
+	resolved_files.clear();
+	metadata.clear();
+	externally_populated = false;
+	external_population_done = false;
+	files_exhausted = false;
+	build_populated = true;
 }
 
 OpenFileInfo DeltaMultiFileList::GetFileInternal(idx_t i) const {
-	// C′ build pipeline (barriered) or streaming sink (concurrent): the file list is produced by
+	// C′ build pipeline: the file list is produced by
 	// PhysicalDeltaLoad's sink. Serve resolved_files directly — no kernel snapshot/scan init, no lazy
 	// nested query, no kernel iterator. Checked BEFORE EnsureScanInitialized so a sink-driven scan
-	// never pays for (or depends on) the kernel scan-metadata machinery. In streaming mode `i >= size`
-	// means "caught up to the tail": returning an empty OpenFileInfo makes Scan miss, and
-	// IsFinalizedListing() decides BLOCK (still open) vs EOF (closed).
-	if (externally_populated || streaming_populated) {
+	// never pays for (or depends on) the kernel scan-metadata machinery.
+	if (externally_populated || build_populated) {
 		if (i < resolved_files.size()) {
 			return resolved_files[i];
 		}
@@ -1018,33 +995,9 @@ void DeltaMultiFileList::InitializeScan() const {
 	initialized_scan = true;
 }
 
-string DeltaMultiFileList::BuildReconciliationSQL(ClientContext &context) const {
-	// Build the data-skipping predicate from the pushed-down filters (same translation the kernel
-	// iterator path uses). The kernel visits it ONCE inside kdf_scan_open while this PredicateVisitor
-	// (which borrows table_filters) is alive — DriveScan is synchronous.
-	optional_ptr<ffi::EnginePredicate> predicate;
-	PredicateVisitor visitor(global_columns, &table_filters);
-	if (!table_filters.filters.empty()) {
-		predicate = &visitor;
-	}
-
-	int64_t sm_version = (version == DConstants::INVALID_INDEX) ? -1 : static_cast<int64_t>(version);
-
-	// Drive the kernel's metadata-only scan SM to the file-list reconciliation SQL (DuckDB executes
-	// every Reduce inside DriveScan). The returned SQL contains the stats-based file-skip FILTER when a
-	// predicate was threaded in — we hand it back for the caller to bind as a visible child subplan.
-	string sql = delta_sdk::DriveScan(GetPath(), sm_version, /* metadata_only= */ true, context, predicate);
-	if (visitor.error_data.HasError()) {
-		throw IOException("delta_scan: predicate translation failed for '%s': %s", GetPath(),
-		                  visitor.error_data.Message());
-	}
-	return sql;
-}
-
 unique_ptr<TableRef> DeltaMultiFileList::BuildReconciliationRef(ClientContext &context) const {
-	// Same inputs as BuildReconciliationSQL — the pushed-down table_filters + global_columns — but the
-	// facade builds the kernel data-skipping predicate itself and lowers via DeltaPlanBuilder (SQL
-	// fallback inside). We hand it an optional_ptr to table_filters only when non-empty so no predicate
+	// The facade builds the kernel data-skipping predicate and lowers it via DeltaPlanBuilder. We hand
+	// it an optional_ptr to table_filters only when non-empty so no predicate
 	// is threaded for an unfiltered scan.
 	int64_t sm_version = (version == DConstants::INVALID_INDEX) ? -1 : static_cast<int64_t>(version);
 	optional_ptr<const TableFilterSet> filters;

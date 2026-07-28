@@ -38,7 +38,7 @@ enum class DeltaScanIRKind { Metadata, Data };
 //! crosses this seam); pass an empty/absent `filters` for no pushdown.
 //!
 //! If the IR path cannot lower a node yet (DeltaError "unsupported node"), this transparently falls
-//! back to the DriveScan SQL path and still returns a `TableRef` — so the caller always gets a
+//! returns a `TableRef` through the protobuf plan path — so the caller always gets a
 //! working relation and never sees an "unsupported" error. Throws only on genuine table/IO failure.
 unique_ptr<TableRef> BuildDeltaScanRef(const string &path, int64_t version, DeltaScanIRKind kind,
                                        const vector<DeltaMultiFileColumnDefinition> &columns,

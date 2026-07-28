@@ -23,7 +23,7 @@ namespace duckdb {
 // Delta columnMapping.physicalName lives in `identifier` (a VARCHAR Value); promote it to the field
 // name at every level and rebuild the nested LogicalType so its struct field names are physical too.
 // Leaf types are left exactly as bound (they match the parquet), so no spurious casts are introduced.
-// Used only in streaming (delta_load) mode, so the reader emits physical-named structs that the
+// Used only in build-populated (delta_load) mode, so the reader emits physical-named structs that the
 // kernel's terminal Transform can address; the Transform performs the physical->logical rename.
 static void MakeColumnPhysical(MultiFileColumnDefinition &col) {
 	if (!col.identifier.IsNull() && col.identifier.type().id() == LogicalTypeId::VARCHAR) {
@@ -223,14 +223,14 @@ ReaderInitializeType DeltaMultiFileReader::InitializeReader(MultiFileReaderData 
 
 	auto &scan_columns = snapshot.GetLazyLoadedGlobalColumns();
 
-	// Streaming (delta_load TVF) mode: the reader must emit the *physical* read schema so the kernel's
+	// Build-populated (delta_load TVF) mode: the reader must emit the *physical* read schema so the kernel's
 	// terminal Transform can address columns by physical name and do the physical->logical rename. We
 	// reuse the snapshot's lazy_loaded_schema (correct column mapping by columnMapping.physicalName
 	// identifier, correct leaf types matching the parquet) but rewrite every field NAME (top-level AND
 	// nested struct/list/map) to its physical identifier. That makes the produced struct types carry
 	// physical nested field names without disturbing the mapping or leaf types. Regular delta_scan keeps
 	// the logical names (not applied here).
-	if (snapshot.IsStreamingPopulated()) {
+	if (snapshot.IsBuildPopulated()) {
 		vector<MultiFileColumnDefinition> physical_columns =
 		    DeltaMultiFileColumnDefinition::ConvertToBase(scan_columns);
 		for (auto &col : physical_columns) {

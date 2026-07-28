@@ -32,7 +32,7 @@ namespace duckdb {
 // LogicalDeltaGet (delta_scan only), converts those filter expressions into a TableFilterSet with the
 // same FilterCombiner the standard path uses, pushes them into the operator's DeltaMultiFileList
 // (populating table_filters), and swaps the resulting filtered list into the operator's bind_data. The
-// reconciliation subplan then builds its PredicateVisitor from those table_filters (BuildReconciliationSQL),
+// reconciliation subplan then builds its PredicateVisitor from those table_filters,
 // so it prunes files exactly like step-1. The LogicalFilter is left in place (it re-checks rows; the
 // pushdown only adds stats-based file skipping — never changes results). Only active for the operator path.
 //===--------------------------------------------------------------------===//
@@ -66,7 +66,7 @@ static void DeltaScanPushdownIntoOperator(LogicalDeltaGet &op, vector<unique_ptr
 	// lower-level PushdownInternal directly (NOT ComplexFilterPushdown) on purpose: ComplexFilterPushdown
 	// runs ReportFilterPushdown, which — when delta_scan_explain_files_filtered is on — calls
 	// GetTotalFileCount on the new list and EAGERLY populates it via the synchronous kernel iterator. The
-	// reconciliation subplan's streaming sink would then append a SECOND time, double-counting files. Going
+	// reconciliation subplan's build sink would then append a SECOND time, double-counting files. Going
 	// through PushdownInternal keeps the new list empty so the subplan sink is its sole populator.
 	FilterCombiner combiner(context);
 	for (auto riter = filter_exprs.rbegin(); riter != filter_exprs.rend(); ++riter) {
@@ -78,10 +78,10 @@ static void DeltaScanPushdownIntoOperator(LogicalDeltaGet &op, vector<unique_ptr
 		return; // nothing prunable
 	}
 	auto new_list = delta_list->PushdownInternal(context, filter_set);
-	// The reconciliation subplan feeds the swapped-in list from a streaming sink. Mark it streaming so a
+	// The reconciliation subplan feeds the swapped-in list from a build sink. Mark it build-populated so a
 	// bind/plan-time GetCardinality on this list serves resolved_files (empty) instead of triggering the
 	// synchronous kernel scan. Mirrors the bind-time mark in DeltaScanBindOperator.
-	new_list->MarkStreamingPopulated();
+	new_list->MarkBuildPopulated();
 	mf_bind->file_list = shared_ptr<MultiFileList>(std::move(new_list));
 }
 
@@ -90,13 +90,12 @@ static void DeltaScanPushdownIntoOperator(LogicalDeltaGet &op, vector<unique_ptr
 // into a REAL bound child subplan so EXPLAIN shows its nodes (READ_JSON per commit, UNION, arg_max dedup,
 // tombstone FILTER, and — when a WHERE predicate was pushed down — the data-skipping FILTER over
 // add.stats_parsed). Runs post-pushdown, so the dynamic predicate already threaded into the operator's
-// DeltaMultiFileList::table_filters is baked into the kernel-lowered SQL. PhysicalDeltaLoad's existing
-// streaming build-sink then populates the file list from this subplan's rows (path / fileConstantValues /
+// DeltaMultiFileList::table_filters is baked into the kernel-lowered plan. PhysicalDeltaLoad's existing
+// build sink then populates the file list from this subplan's rows (path / fileConstantValues /
 // deletionVector), exactly as the delta_load TVF does — no nested Connection.
 //===--------------------------------------------------------------------===//
-static void DeltaScanAttachReconciliationSubplan(LogicalDeltaGet &op, OptimizerExtensionInput &input) {
-	// Only plain delta_scan (no build child yet). delta_load already has its subplan + build columns.
-	if (!op.children.empty() || op.build_path_col != DConstants::INVALID_INDEX || !op.bind_data) {
+void BindDeltaReconciliationChild(LogicalDeltaGet &op, ClientContext &context, Binder *parent_binder) {
+	if (op.is_load || !op.bind_data) {
 		return;
 	}
 	auto *mf_bind = dynamic_cast<MultiFileBindData *>(op.bind_data.get());
@@ -111,9 +110,8 @@ static void DeltaScanAttachReconciliationSubplan(LogicalDeltaGet &op, OptimizerE
 	// Lower the kernel metadata-only scan SM to a reconciliation TableRef via the proto-IR path
 	// (DeltaPlanBuilder), WITH the pushed-down predicate baked in (the stats-based file-skip FILTER over
 	// add.stats_parsed is present exactly when a WHERE predicate reached table_filters). DuckDB drives
-	// the SM (executes each Reduce) inside the facade, which falls back to the SQL path per-scan if a
-	// node isn't lowerable yet.
-	auto recon_ref = delta_list->BuildReconciliationRef(input.context);
+	// the SM (executes each Reduce) inside the protobuf-only facade.
+	auto recon_ref = delta_list->BuildReconciliationRef(context);
 
 	// Bind the TableRef into a fully-planned child LogicalOperator. Wrap it as `SELECT * FROM (<ref>)`
 	// so it binds as a query. The child binder shares the query's GlobalBinderState (bound_tables
@@ -124,7 +122,7 @@ static void DeltaScanAttachReconciliationSubplan(LogicalDeltaGet &op, OptimizerE
 	recon_select->from_table = std::move(recon_ref);
 	auto recon_stmt = make_uniq<SelectStatement>();
 	recon_stmt->node = std::move(recon_select);
-	auto child_binder = Binder::CreateBinder(input.context, &input.optimizer.binder);
+	auto child_binder = Binder::CreateBinder(context, parent_binder);
 	// Bind through the public SQLStatement& overload (Bind(SelectStatement&) is private).
 	SQLStatement &recon_sql_stmt = *recon_stmt;
 	auto bound = child_binder->Bind(recon_sql_stmt);
@@ -149,9 +147,26 @@ static void DeltaScanAttachReconciliationSubplan(LogicalDeltaGet &op, OptimizerE
 	}
 
 	// Attach as the operator's build child. CreatePlan plans it as the build/sink pipeline; BuildPipelines
-	// runs it as a streaming child meta pipeline feeding the source. Attached AFTER all optimizers, so
+	// runs it as a barriered child meta pipeline feeding the source. Attached AFTER all optimizers, so
 	// RemoveUnusedColumns never prunes the subplan's terminal columns (the sink reads them by position).
+	op.children.clear();
 	op.children.push_back(std::move(bound.plan));
+	// The optimizer may replace the bind-time child after ResolveTypes has already recorded column
+	// dependencies. Rebuild them against the replacement's fresh table indexes; retaining the old
+	// BoundColumnRefExpressions makes the physical planner look for bindings that no longer exist.
+	op.expressions.clear();
+	op.children[0]->ResolveOperatorTypes();
+	auto child_bindings = op.children[0]->GetColumnBindings();
+	for (idx_t i = 0; i < child_bindings.size(); i++) {
+		op.expressions.push_back(
+		    make_uniq<BoundColumnRefExpression>(op.children[0]->types[i], child_bindings[i]));
+	}
+}
+
+static void DeltaScanAttachReconciliationSubplan(LogicalDeltaGet &op, OptimizerExtensionInput &input) {
+	// Replace the bind-time baseline with a plan built from the post-pushdown file list. delta_load
+	// already carries its Load input child and must never pass through this path.
+	BindDeltaReconciliationChild(op, input.context, &input.optimizer.binder);
 }
 
 static void DeltaScanOptimizeFilterPushdown(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {
@@ -167,8 +182,8 @@ static void DeltaScanOptimizeFilterPushdown(OptimizerExtensionInput &input, uniq
 	// Attach the reconciliation subplan to EVERY delta_scan operator (with or without a WHERE above it).
 	// Done when we directly reach the operator in the walk — after the parent filter (if any) has already
 	// pushed its predicate into the file list above — so the subplan SQL reflects it. Every delta_scan's
-	// file list was marked streaming (at bind / on pushdown), so it MUST get a sink: attaching the subplan
-	// unconditionally is what populates it (a streaming list with no sink would hang).
+	// file list was marked build-populated (at bind / on pushdown), so it MUST get a sink: attaching the
+	// subplan unconditionally is what populates it.
 	if (plan->type == LogicalOperatorType::LOGICAL_EXTENSION_OPERATOR) {
 		auto &ext = plan->Cast<LogicalExtensionOperator>();
 		if (ext.GetExtensionName() == "delta_scan") {
@@ -187,17 +202,13 @@ void RegisterDeltaScanOptimizer(DBConfig &config) {
 }
 
 PhysicalOperator &LogicalDeltaGet::CreatePlan(ClientContext &context, PhysicalPlanGenerator &planner) {
-	// M0: scan all returned columns, no pushed filters (projection/filter pushdown into the custom
-	// operator is a later milestone — Q4). The file list is still resolved lazily inside
-	// DeltaMultiFileList, so behavior matches the current PhysicalTableScan path exactly; only the
-	// operator class changes.
-	vector<ColumnIndex> column_ids;
-	column_ids.reserve(returned_types.size());
-	for (idx_t i = 0; i < returned_types.size(); i++) {
-		column_ids.emplace_back(i);
+	if (column_ids.empty()) {
+		auto empty = virtual_columns.find(COLUMN_IDENTIFIER_EMPTY);
+		column_ids.emplace_back(empty != virtual_columns.end() ? COLUMN_IDENTIFIER_EMPTY : 0);
+		ResolveTypes();
 	}
 
-	vector<LogicalType> output_types = returned_types;
+	vector<LogicalType> output_types = types;
 	vector<LogicalType> all_types = returned_types;
 	vector<string> names = returned_names;
 	auto params = parameters;
@@ -217,6 +228,7 @@ PhysicalOperator &LogicalDeltaGet::CreatePlan(ClientContext &context, PhysicalPl
 		delta_scan.build_path_col = build_path_col;
 		delta_scan.build_fcv_col = build_fcv_col;
 		delta_scan.build_dv_col = build_dv_col;
+		delta_scan.build_metadata_cols = build_metadata_cols;
 	}
 	return scan;
 }
@@ -235,10 +247,9 @@ static DeltaMultiFileList &GetDeltaFileList(FunctionData &bind_data) {
 //===--------------------------------------------------------------------===//
 class DeltaScanBuildGlobalState : public GlobalSinkState {};
 
-// Local sink state. In streaming mode each Sink() chunk publishes its resolved entries to the shared
-// list immediately (so the concurrent source sees files as they arrive), so this holds only a small
-// reusable scratch batch — DV resolution still runs lock-free in BuildFileEntry before the locked
-// append.
+// Local sink state. Each Sink() chunk publishes its resolved entries to the shared list; the source
+// starts only after the child pipeline finalizes. DV resolution remains lock-free in BuildFileEntry
+// before the short locked append.
 class DeltaScanBuildLocalState : public LocalSinkState {
 public:
 	vector<DeltaMultiFileList::ResolvedFileEntry> entries;
@@ -271,21 +282,24 @@ SinkResultType PhysicalDeltaLoad::Sink(ExecutionContext &context, DataChunk &chu
 		Value path_val = chunk.GetValue(build_path_col, r);
 		Value fcv_val = build_fcv_col != DConstants::INVALID_INDEX ? chunk.GetValue(build_fcv_col, r) : Value();
 		Value dv_val = build_dv_col != DConstants::INVALID_INDEX ? chunk.GetValue(build_dv_col, r) : Value();
+		vector<pair<string, Value>> metadata_values;
+		metadata_values.reserve(build_metadata_cols.size());
+		for (const auto &metadata_col : build_metadata_cols) {
+			metadata_values.emplace_back(metadata_col.first, chunk.GetValue(metadata_col.second, r));
+		}
 		// Lock-free build (resolves the DV in parallel across sink threads).
-		auto entry = file_list.BuildFileEntry(path_val, fcv_val, dv_val);
+		auto entry = file_list.BuildFileEntry(path_val, fcv_val, dv_val, metadata_values);
 		if (!entry.file.path.empty()) {
 			lstate.entries.push_back(std::move(entry));
 		}
 	}
-	// Publish this chunk's files to the shared list NOW (under one lock) and wake the concurrent
-	// source — streaming: the source can start scanning these files before the rest of the input feed
-	// has been consumed.
+	// Publish this chunk's files to the shared build list under one lock.
 	file_list.AppendResolvedEntries(std::move(lstate.entries));
 	return SinkResultType::NEED_MORE_INPUT;
 }
 
 SinkCombineResultType PhysicalDeltaLoad::Combine(ExecutionContext &context, OperatorSinkCombineInput &input) const {
-	// Nothing to flush — Sink publishes each chunk immediately for streaming. (Kept for the sink API.)
+	// Nothing to flush — Sink publishes each chunk immediately. (Kept for the sink API.)
 	return SinkCombineResultType::FINISHED;
 }
 
@@ -295,46 +309,6 @@ SinkFinalizeType PhysicalDeltaLoad::Finalize(Pipeline &pipeline, Event &event, C
 	// at the tail so it observes closed-and-drained and finishes.
 	GetDeltaFileList(*bind_data).MarkExternallyPopulated();
 	return SinkFinalizeType::READY;
-}
-
-//===--------------------------------------------------------------------===//
-// Streaming source side
-//===--------------------------------------------------------------------===//
-unique_ptr<GlobalSourceState> PhysicalDeltaLoad::GetGlobalSourceState(ClientContext &context) const {
-	auto state = PhysicalTableScan::GetGlobalSourceState(context);
-	auto &file_list = GetDeltaFileList(*bind_data);
-	// Register the source's blockable state so the sink can wake it on append/close. GlobalSourceState
-	// publicly derives StateWithBlockableTasks.
-	file_list.SetBlockedSourceState(state.get());
-	return state;
-}
-
-SourceResultType PhysicalDeltaLoad::GetDataInternal(ExecutionContext &context, DataChunk &chunk,
-                                                    OperatorSourceInput &input) const {
-	auto result = PhysicalTableScan::GetDataInternal(context, chunk, input);
-	if (result != SourceResultType::FINISHED || chunk.size() != 0) {
-		return result;
-	}
-	// FINISHED with no rows. If the streaming listing is still open, this is a transient catch-up to the
-	// tail (the multi-file source kept the scan resumable via blocked_on_growing_list), NOT true EOF.
-	// Block until the sink appends more files or closes the listing. input.global_state is a
-	// GlobalSourceState, which publicly derives StateWithBlockableTasks (Lock/BlockSource).
-	auto &file_list = GetDeltaFileList(*bind_data);
-	if (file_list.IsFinalizedListing()) {
-		return SourceResultType::FINISHED;
-	}
-	// Caught up to the tail of a still-open streaming listing. Acquire the source-state lock and
-	// RE-CHECK closed-ness under it before blocking. WakeBlockedSource (append + the final close-wake in
-	// Finalize) takes this SAME lock, so any close that lands after the first check above is either
-	// observed here (return FINISHED, no block) or its wake is delivered to our now-registered block —
-	// never lost. Without this re-check, a close firing between the first check and BlockSource would
-	// wake zero registered tasks and strand this source forever (every worker thread ends up parked in
-	// futex_wait at 0% CPU). This is the lost-wakeup that deadlocked multi-delta_scan queries.
-	auto guard = input.global_state.Lock();
-	if (file_list.IsFinalizedListing()) {
-		return SourceResultType::FINISHED;
-	}
-	return input.global_state.BlockSource(guard, input.interrupt_state);
 }
 
 //===--------------------------------------------------------------------===//
@@ -349,14 +323,13 @@ void PhysicalDeltaLoad::BuildPipelines(Pipeline &current, MetaPipeline &meta_pip
 	// This operator is the source of the current (probe) pipeline.
 	state.SetPipelineSource(current, *this);
 	if (!children.empty()) {
-		// Enter streaming mode: the source serves resolved_files directly and reports the listing as
-		// non-finalized (so it BLOCKs at the tail) until the sink's Finalize closes it.
-		GetDeltaFileList(*bind_data).MarkStreamingPopulated();
-		// The input feed (scan_file_row producer) sinks into this operator. Use the STREAMING child
-		// meta pipeline so the feed runs CONCURRENTLY with the source side — the source hands out
-		// row-group morsels of files already resolved while the feed keeps appending more, and blocks
-		// (SourceResultType::BLOCKED) only when momentarily caught up. No build-before-probe barrier.
-		auto &child_meta_pipeline = meta_pipeline.CreateStreamingChildMetaPipeline(current, *this);
+		GetDeltaFileList(*bind_data).ResetBuildExecution();
+		// Materialize the reconciled file list before the multi-file source starts. DuckDB's
+		// multi-file reader snapshots traversal state and is not safe to race with list growth: doing
+		// so can rescan a path without its DV metadata, and can strand a source waiting for an append on
+		// repeated execution. The ordinary child meta-pipeline installs the same build-before-probe
+		// dependency used by hash joins and CTE materialization.
+		auto &child_meta_pipeline = meta_pipeline.CreateChildMetaPipeline(current, *this);
 		child_meta_pipeline.Build(children[0]);
 	}
 }

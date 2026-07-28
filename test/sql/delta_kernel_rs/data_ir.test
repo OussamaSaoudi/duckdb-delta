@@ -1,0 +1,49 @@
+# name: test/sql/delta_kernel_rs/data_ir.test
+# description: full kernel ResultPlan lowering through the C++ SDK
+# group: [delta_kernel_rs]
+
+require parquet
+
+require json
+
+require delta
+
+require-env DELTA_KERNEL_TESTS_PATH
+
+# Terminal Transform over a partitioned data Load.
+query III rowsort
+SELECT * FROM delta_scan_data_ir('${DELTA_KERNEL_TESTS_PATH}/basic_partitioned')
+----
+NULL	6	6.6
+a	1	1.1
+a	4	4.4
+b	2	2.2
+c	3	3.3
+e	5	5.5
+
+# The terminal data plan must apply the deletion vector before the outer filter.
+query I rowsort
+SELECT value
+FROM delta_scan_data_ir('${DELTA_KERNEL_TESTS_PATH}/table-with-dv-small')
+WHERE value > 3
+----
+4
+5
+6
+7
+8
+
+# Checkpoint replay uses a declared Parquet schema, including typed NULL defaults for
+# action columns that are absent from the physical checkpoint.
+query III
+SELECT count(*), min(part), max(part)
+FROM delta_scan_data_ir('data/inlined/issue_303_partitioned/delta_lake')
+----
+16	42	42
+
+# Snapshot version is passed through the C++ state-machine SDK.
+query II
+SELECT count(*), min(part)
+FROM delta_scan_data_ir('data/inlined/issue_303_partitioned/delta_lake', version = 5)
+----
+10	42

@@ -7,7 +7,7 @@
 //   - LowerPredicate:  expressions::Predicate  -> DuckDB ParsedExpression (boolean)
 //
 // C++17 island (includes the generated proto structs). Unsupported constructs throw
-// delta::DeltaError so the whole-plan SQL fallback (Phase E) takes over.
+// delta::DeltaError so unsupported plans fail explicitly.
 //===----------------------------------------------------------------------===//
 #pragma once
 

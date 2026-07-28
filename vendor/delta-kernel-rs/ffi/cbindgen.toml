@@ -1,0 +1,29 @@
+# this file gets loaded by build.rs as the set of default options for cbindgen
+
+
+# default to generating c bindings
+language = "C"
+
+pragma_once = true
+
+# only applies to Cxx
+namespace = "ffi"
+cpp_compat = true
+
+[defines]
+"feature = default-engine-rustls" = "DEFINE_DEFAULT_ENGINE_RUSTLS"
+"feature = default-engine-base" = "DEFINE_DEFAULT_ENGINE_BASE"
+
+[export.mangle]
+remove_underscores = true
+
+[parse]
+# Whether to parse dependent crates and include their types in the output
+# default: false
+parse_deps = true
+
+# An allow-list of crate names that are allowed to be parsed. If this is defined,
+# only crates found in this list will ever be parsed.
+#
+# default: there is no allow-list (NOTE: this is the opposite of [])
+include = ["arrow", "arrow-data", "arrow-schema", "delta_kernel"]

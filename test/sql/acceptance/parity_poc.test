@@ -10,7 +10,7 @@
 #     (one DuckDB instance, N threads each with its own Connection) -- the thing
 #     the Python process-per-shard harness structurally cannot do.
 #
-# WORKLOADS_PATH must point at ~/delta-kernel-rs/acceptance/workloads
+# WORKLOADS_PATH normally points at vendor/delta-kernel-rs/acceptance/workloads
 
 require parquet
 

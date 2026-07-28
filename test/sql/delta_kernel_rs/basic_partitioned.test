@@ -4,21 +4,23 @@
 
 require parquet
 
+require json
+
 require delta
 
 require-env DELTA_KERNEL_TESTS_PATH
 
-query III
+query III rowsort
 SELECT * FROM delta_scan('${DELTA_KERNEL_TESTS_PATH}/basic_partitioned')
 ----
 NULL	6	6.6
-a	4	4.4
-e	5	5.5
 a	1	1.1
+a	4	4.4
 b	2	2.2
 c	3	3.3
+e	5	5.5
 
 query II
 EXPLAIN FROM delta_scan('${DELTA_KERNEL_TESTS_PATH}/basic_partitioned')
 ----
-physical_plan	<REGEX>:.*6 rows.*
+physical_plan	<REGEX>:.*HASH_GROUP_BY.*

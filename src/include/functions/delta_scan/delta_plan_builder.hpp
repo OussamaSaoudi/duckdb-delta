@@ -1,10 +1,10 @@
 //===----------------------------------------------------------------------===//
 // DeltaPlanBuilder — lower a kernel plan-IR (proto) into a DuckDB unbound TableRef.
 //
-// Phase D of the plan-IR SDK migration (SDK_IMPLEMENTATION_PLAN.md). The kernel emits the scan as an
+// The kernel emits the scan as an
 // engine-neutral SSA-DAG plan IR (delta::plan::ResultPlan). This builder walks that DAG and lowers
 // each node into DuckDB's unbound parse tree — a `unique_ptr<TableRef>` the binder plans exactly like
-// the SQL path's `SubqueryRef` (that is the integration seam: `delta_scan.cpp` already returns a
+// a `TableRef` (the integration seam: `delta_scan.cpp` already returns a
 // TableRef via bind_replace).
 //
 // This is the C++17 "decode island": it #includes the generated proto structs (plan.pb.h), so it
@@ -13,7 +13,7 @@
 //
 // Coverage grows one NodeKind at a time (D1..D7). Unimplemented nodes throw
 // `delta::DeltaError("unsupported node: ...")`; the caller (Phase E) catches that and falls back to
-// the DriveScan SQL path for the whole scan, so parity never regresses while coverage fills in.
+// unsupported nodes fail explicitly instead of switching execution transports.
 //===----------------------------------------------------------------------===//
 #pragma once
 
@@ -34,7 +34,7 @@ public:
 	DeltaPlanBuilder() = default;
 
 	//! Lower a full ResultPlan → the TableRef producing the terminal node's rows. Throws
-	//! `delta::DeltaError` if any node kind is not yet supported (caller falls back to SQL).
+	//! `delta::DeltaError` if any node kind is not yet supported.
 	unique_ptr<TableRef> Lower(const ::delta::kernel::plan::ResultPlan &result_plan);
 
 private:
@@ -53,8 +53,12 @@ private:
 	// SSA scratch: output RefId -> the lowered TableRef for that node. Populated in DAG order.
 	std::unordered_map<uint32_t, unique_ptr<TableRef>> lowered_;
 	// SSA scratch: output RefId -> that node's output schema (points into the ResultPlan proto, which
-	// outlives the walk). Used to thread each node's input relation schema into expression lowering.
+	// outlives the walk, or into owned_schemas_ for schemas derived by the engine). Used to thread each
+	// node's input relation schema into expression lowering.
 	std::unordered_map<uint32_t, const ::delta::kernel::schema::StructType *> schemas_;
+	// Load output is file_schema plus its metadata-derived input columns, so it does not exist as one
+	// message in the wire plan. Keep those synthesized schemas alive for the duration of the walk.
+	std::unordered_map<uint32_t, unique_ptr<::delta::kernel::schema::StructType>> owned_schemas_;
 };
 
 } // namespace duckdb

@@ -92,6 +92,7 @@ int main() {
 		CHECK(!threw, "ScanParquet should lower without throwing");
 		CHECK(Contains(sql, "read_parquet"), "ScanParquet should emit read_parquet");
 		CHECK(Contains(sql, "part-0.parquet"), "ScanParquet should reference the file path");
+		CHECK(Contains(sql, "dkrp_"), "ScanParquet columns should be source-qualified to avoid alias self-reference");
 	}
 
 	// (2) ScanParquet with no files → typed empty relation (no read_parquet, a false filter).
@@ -177,6 +178,47 @@ int main() {
 	}
 
 	// (7) MaxByVersion over ScanParquet → arg_max hash aggregate.
+	// (7) A Project/Transform after Load sees metadata-derived columns in the Load output schema.
+	//     This is the terminal shape of a full data scan: physical file columns plus per-file constants
+	//     are transformed into the logical row schema.
+	{
+		ResultPlan rp;
+		auto *vals = AddNode(rp, 0, {})->mutable_op()->mutable_values();
+		AddField(vals->mutable_schema(), "path", SIMPLE_PRIMITIVE_TYPE_STRING);
+		auto *meta = vals->mutable_schema()->add_fields();
+		meta->set_name("fileConstantValues");
+		meta->set_nullable(true);
+		AddField(meta->mutable_data_type()->mutable_struct_(), "partition", SIMPLE_PRIMITIVE_TYPE_STRING);
+
+		auto *load = AddNode(rp, 1, {0})->mutable_op()->mutable_load();
+		load->set_file_type(::delta::kernel::plan::FILE_TYPE_PARQUET);
+		load->set_base_url("file:///tmp/t/");
+		AddField(load->mutable_file_schema(), "value", SIMPLE_PRIMITIVE_TYPE_LONG);
+		load->mutable_file_meta()->mutable_path_column()->add_path("path");
+		load->add_metadata_derived_columns()->add_path("fileConstantValues");
+
+		auto *project = AddNode(rp, 2, {1})->mutable_op()->mutable_project();
+		auto *named = project->add_named_exprs();
+		named->set_name("row");
+		named->mutable_expr()->mutable_transform(); // top-level identity transform
+		auto *row = project->mutable_output_schema()->add_fields();
+		row->set_name("row");
+		row->set_nullable(true);
+		auto *row_struct = row->mutable_data_type()->mutable_struct_();
+		AddField(row_struct, "value", SIMPLE_PRIMITIVE_TYPE_LONG);
+		auto *row_meta = row_struct->add_fields();
+		row_meta->set_name("fileConstantValues");
+		row_meta->set_nullable(true);
+		AddField(row_meta->mutable_data_type()->mutable_struct_(), "partition", SIMPLE_PRIMITIVE_TYPE_STRING);
+
+		rp.set_result(2);
+		bool threw;
+		std::string sql = LowerToString(rp, threw);
+		CHECK(!threw, "Project after Load should see metadata-derived columns in its input schema");
+		CHECK(Contains(sql, "fileConstantValues"), "terminal Transform should preserve the derived column");
+	}
+
+	// (8) MaxByVersion over ScanParquet → arg_max hash aggregate.
 	{
 		ResultPlan rp;
 		auto *scan = AddNode(rp, 0, {})->mutable_op()->mutable_scan_parquet();
@@ -195,7 +237,7 @@ int main() {
 		CHECK(Contains(sql, "GROUP BY"), "MaxByVersion should group");
 	}
 
-	// (8) UnionAll of two ScanParquets → UNION ALL BY NAME.
+	// (9) UnionAll of two ScanParquets → UNION ALL BY NAME.
 	{
 		ResultPlan rp;
 		auto *a = AddNode(rp, 0, {})->mutable_op()->mutable_scan_parquet();
@@ -212,7 +254,7 @@ int main() {
 		CHECK(Contains(sql, "UNION ALL BY NAME"), "UnionAll should emit UNION ALL BY NAME");
 	}
 
-	// (9) EquiJoin (LeftAnti) → ANTI JOIN ... ON IS NOT DISTINCT FROM.
+	// (10) EquiJoin (LeftAnti) → ANTI JOIN ... ON IS NOT DISTINCT FROM.
 	{
 		ResultPlan rp;
 		auto *l = AddNode(rp, 0, {})->mutable_op()->mutable_scan_parquet();
@@ -232,7 +274,7 @@ int main() {
 		CHECK(Contains(sql, "ANTI"), "EquiJoin(LeftAnti) should emit an ANTI JOIN");
 	}
 
-	// (10) DAG fan-out: one node consumed by two parents (union of a node and a filter over it). The
+	// (11) DAG fan-out: one node consumed by two parents (union of a node and a filter over it). The
 	//      walk must Copy the shared child, not move it (else the second consumer sees null → crash).
 	{
 		ResultPlan rp;
@@ -252,7 +294,7 @@ int main() {
 		CHECK(Contains(sql, "UNION ALL BY NAME"), "fan-out union should still emit the union");
 	}
 
-	// (11) Missing terminal RefId → clean DeltaError, not a crash.
+	// (12) Missing terminal RefId → clean DeltaError, not a crash.
 	{
 		ResultPlan rp;
 		AddNode(rp, 0, {})->mutable_op()->mutable_values();

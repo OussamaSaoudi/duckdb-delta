@@ -1,0 +1,76 @@
+[workspace]
+members = [
+    "acceptance",
+    "benchmarks",
+    "derive-macros",
+    "ffi",
+    "kernel",
+    "kernel/examples/*",
+    "test-utils",
+    "feature-tests",
+    "mem-test",
+    "unity-catalog-delta-rest-client", # WIP: this is an experimental UC client for catalog-managed table work
+    "delta-kernel-unity-catalog", # WIP: this is an experimental UC catalog implementation
+    "unity-catalog-delta-client-api", # WIP: transport-agnostic UC client API traits
+    "delta-kernel-datafusion-engine",
+]
+# note that in addition to the members above, the workspace includes examples:
+# - inspect-table
+# - read-table-changes
+# - read-table-multi-threaded
+# - read-table-single-threaded
+# - write-table
+resolver = "3"
+
+# Patched DataFusion fork adding virtual-column hooks + parquet field-ID-aware root adaptation
+# to `datafusion-datasource-parquet`. Tracks DataFusion 53.1.0 plus the
+# `delta-kernel-vendor-patch` branch on the fork. Every datafusion crate in our dep graph
+# must come from the fork — otherwise type identity diverges between the fork's parquet
+# crate (which sees fork-built sibling types) and crates.io copies brought in transitively.
+[patch.crates-io]
+# TEMP: pointing at local fork for upstream nested_struct.rs sync. Revert to
+# `git = ".../OussamaSaoudi/datafusion.git", rev = "<new-rev>"` once the fork
+# branch is pushed.
+datafusion = { path = "/home/oussama.saoudi/datafusion-fork/datafusion/core" }
+datafusion-catalog = { path = "/home/oussama.saoudi/datafusion-fork/datafusion/catalog" }
+datafusion-catalog-listing = { path = "/home/oussama.saoudi/datafusion-fork/datafusion/catalog-listing" }
+datafusion-common = { path = "/home/oussama.saoudi/datafusion-fork/datafusion/common" }
+datafusion-common-runtime = { path = "/home/oussama.saoudi/datafusion-fork/datafusion/common-runtime" }
+datafusion-datasource = { path = "/home/oussama.saoudi/datafusion-fork/datafusion/datasource" }
+datafusion-datasource-json = { path = "/home/oussama.saoudi/datafusion-fork/datafusion/datasource-json" }
+datafusion-datasource-parquet = { path = "/home/oussama.saoudi/datafusion-fork/datafusion/datasource-parquet" }
+datafusion-execution = { path = "/home/oussama.saoudi/datafusion-fork/datafusion/execution" }
+datafusion-expr = { path = "/home/oussama.saoudi/datafusion-fork/datafusion/expr" }
+datafusion-expr-common = { path = "/home/oussama.saoudi/datafusion-fork/datafusion/expr-common" }
+datafusion-functions = { path = "/home/oussama.saoudi/datafusion-fork/datafusion/functions" }
+datafusion-functions-aggregate = { path = "/home/oussama.saoudi/datafusion-fork/datafusion/functions-aggregate" }
+datafusion-functions-aggregate-common = { path = "/home/oussama.saoudi/datafusion-fork/datafusion/functions-aggregate-common" }
+datafusion-functions-nested = { path = "/home/oussama.saoudi/datafusion-fork/datafusion/functions-nested" }
+datafusion-functions-window = { path = "/home/oussama.saoudi/datafusion-fork/datafusion/functions-window" }
+datafusion-functions-window-common = { path = "/home/oussama.saoudi/datafusion-fork/datafusion/functions-window-common" }
+datafusion-optimizer = { path = "/home/oussama.saoudi/datafusion-fork/datafusion/optimizer" }
+datafusion-physical-expr = { path = "/home/oussama.saoudi/datafusion-fork/datafusion/physical-expr" }
+datafusion-physical-expr-adapter = { path = "/home/oussama.saoudi/datafusion-fork/datafusion/physical-expr-adapter" }
+datafusion-physical-expr-common = { path = "/home/oussama.saoudi/datafusion-fork/datafusion/physical-expr-common" }
+datafusion-physical-optimizer = { path = "/home/oussama.saoudi/datafusion-fork/datafusion/physical-optimizer" }
+datafusion-physical-plan = { path = "/home/oussama.saoudi/datafusion-fork/datafusion/physical-plan" }
+datafusion-pruning = { path = "/home/oussama.saoudi/datafusion-fork/datafusion/pruning" }
+datafusion-session = { path = "/home/oussama.saoudi/datafusion-fork/datafusion/session" }
+datafusion-sql = { path = "/home/oussama.saoudi/datafusion-fork/datafusion/sql" }
+
+# datafusion-functions-json 0.53.1 was published against branch-53's API
+# (`ScalarUDFImpl::as_any`, `Cast.data_type`). Apache main (which our datafusion-fork now
+# tracks via PR apache/datafusion#22026) drops `as_any` from the trait (`Any` is a
+# supertrait) and renamed `Cast.data_type` to `Cast.field`. Local fork applies the
+# 2-line patch to keep `json_parse.rs` working.
+datafusion-functions-json = { path = "/home/oussama.saoudi/datafusion-functions-json-fork" }
+
+[workspace.package]
+edition = "2021"
+homepage = "https://delta.io"
+keywords = ["deltalake", "delta", "datalake"]
+license = "Apache-2.0"
+repository = "https://github.com/delta-io/delta-kernel-rs"
+readme = "README.md"
+rust-version = "1.88"
+version = "0.21.0"

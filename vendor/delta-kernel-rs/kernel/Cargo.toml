@@ -1,0 +1,178 @@
+[package]
+name = "delta_kernel"
+description = "Core crate providing a Delta/Deltalake implementation focused on interoperability with a wide range of query engines."
+documentation = "https://docs.rs/delta_kernel"
+edition.workspace = true
+homepage.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+version.workspace = true
+# exclude golden tests + golden test data since they push us over 10MB crate size limit
+# also exlude tests/data since similarly this has large test tables we don't need to ship
+exclude = ["tests/golden_tables.rs", "tests/golden_data/", "tests/data/"]
+rust-version.workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+
+# for cargo-release
+[package.metadata.release]
+pre-release-replacements = [
+  { file = "../README.md", search = "delta_kernel = \"[a-z0-9\\.-]+\"", replace = "delta_kernel = \"{{version}}\"" },
+  { file = "../README.md", search = "version = \"[a-z0-9\\.-]+\"", replace = "version = \"{{version}}\"" },
+]
+pre-release-hook = [
+  "git",
+  "cliff",
+  "--repository",
+  "../",
+  "--config",
+  "../cliff.toml",
+  "--unreleased",
+  "--prepend",
+  "../CHANGELOG.md",
+  "--include-path",
+  "*",
+  "--tag",
+  "{{version}}",
+]
+
+[dependencies]
+delta_kernel_derive = { path = "../derive-macros", version = "0.21.0" }
+bytes = "1.10"
+chrono = "0.4.41"
+crc = "3.2.2"
+genawaiter2 = "0.100"
+indexmap = "2.10.0"
+itertools = "0.14"
+percent-encoding = "2"
+rand = "0.9"
+roaring = "0.11.2"
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = "1"
+strum = { version = "0.27", features = ["derive"] }
+thiserror = "2"
+tracing = { version = "0.1", features = ["log"] }
+tracing-subscriber = "0.3"
+url = "2"
+uuid = { version = "1.18.0", features = ["v4", "fast-rng"] }
+z85 = "3.0.6"
+
+# optional deps
+futures = { version = "0.3", optional = true }
+# dyn-clone: `Clone` for `Box<dyn KernelReducer>` trait objects via the
+# `DynClone` supertrait. Blanket impl covers any `Clone` KDF state, so
+# concrete KDFs don't write their own `clone_boxed`.
+dyn-clone = { version = "1.0", optional = true }
+# Used for fetching direct urls (like pre-signed urls). We disable `default-tls` to avoid
+# pulling in a second rustls crypto provider that conflicts with transitive deps (see
+# feature-tests for a regression test). Each default-engine-* feature selects its TLS backend.
+reqwest = { version = "0.13", default-features = false, optional = true, features = ["charset", "http2", "system-proxy"] }
+# optionally used with default engine (though not required)
+tokio = { version = "1.47", optional = true, features = ["rt-multi-thread"] }
+# both arrow versions below are optional and require object_store
+object_store_12 = { package = "object_store", version = "0.12.3", optional = true, features = ["aws", "azure", "gcp", "http"] }
+object_store_13 = { package = "object_store", version = "0.13.1", optional = true, features = ["aws", "azure", "gcp", "http"] }
+
+# arrow 57
+[dependencies.arrow_57]
+package = "arrow"
+version = "57"
+features = ["chrono-tz", "ffi", "json"]
+optional = true
+[dependencies.parquet_57]
+package = "parquet"
+version = "57"
+features = ["async", "object_store"]
+optional = true
+
+# arrow 58
+[dependencies.arrow_58]
+package = "arrow"
+version = "58"
+features = ["chrono-tz", "ffi", "json"]
+optional = true
+[dependencies.parquet_58]
+package = "parquet"
+version = "58"
+features = ["async", "object_store"]
+optional = true
+
+[features]
+# no default features
+default = []
+# internal-api will make everything marked #[internal_api] public
+internal-api = []
+# prettyprint enables Arrow pretty-print helpers (test/example oriented).
+prettyprint = ["arrow_57?/prettyprint", "arrow_58?/prettyprint"]
+# test-utils exposes test-only constructors for downstream crate tests
+test-utils = ["prettyprint"]
+# integration-test turns on a particularly heavy test for hdfs-object-store
+integration-test = ["hdfs-native-object-store/integration-test"]
+
+# The default versions for arrow/parquet/object_store
+arrow = ["arrow-58"] # latest arrow version
+need-arrow = [] # need-arrow is a marker that the feature needs arrow dep
+
+arrow-57 = ["dep:arrow_57", "dep:parquet_57", "dep:object_store_12"]
+arrow-58 = ["dep:arrow_58", "dep:parquet_58", "dep:object_store_13"]
+arrow-conversion = ["need-arrow"]
+arrow-expression = ["need-arrow"]
+
+# Schema diffing functionality (experimental)
+schema-diff = []
+
+# Declarative plan IR and construction API. Opt-in; the existing
+# `Scan`/`Snapshot`/`Transaction` APIs keep working without it.
+#
+# Enables:
+#   - `internal-api` — because the declarative IR uses kernel-internal
+#     types (most notably `schema::ToSchema`) hidden under `#[internal_api]`.
+#   - `arrow` — the executor works in Arrow types throughout, and KDF
+#     reducer impls return Arrow-typed views over each batch.
+declarative-plans = ["internal-api", "arrow", "dep:dyn-clone"]
+
+# this is an 'internal' feature flag which has all the shared bits from default-engine-native-tls
+# and default-engine-rustls
+default-engine-base = [
+  "arrow-conversion",
+  "arrow-expression",
+  "futures",
+  "need-arrow",
+  "tokio",
+]
+# default-engine-native-tls enables reqwest with the native-tls backend. If you want to use
+# rustls instead, use 'default-engine-rustls' which has no native-tls dependency.
+default-engine-native-tls = ["default-engine-base", "reqwest/native-tls"]
+default-engine-rustls = ["default-engine-base", "reqwest/rustls"]
+
+[build-dependencies]
+rustc_version = "0.4.1"
+
+[dev-dependencies]
+delta_kernel = { path = ".", features = ["test-utils"] }
+# NOTE: test_utils forcibly pulls the default engine and arrow-57. By default it ALSO pulls
+# arrow-58, which takes precedence and would make it impossible to test against arrow-57.
+test_utils = { path = "../test-utils", default-features = false }
+criterion = "0.5"
+# Used for testing parse_url_opts extensibility
+hdfs-native-object-store = { version = "0.16.0" }
+hdfs-native = "0.13.4"
+walkdir = { version = "2.5.0" }
+async-trait = "0.1" # only used for our custom SlowGetStore ObjectStore implementation
+paste = "1.0"
+test-log = { version = "0.2", default-features = false, features = ["trace"] }
+tempfile = "3"
+tracing-subscriber = { version = "0.3", default-features = false, features = [
+  "env-filter",
+  "fmt",
+] }
+rstest = "0.23"
+[[bench]]
+name = "metadata_bench"
+harness = false
+
+[[bench]]
+name = "expression_bench"
+harness = false
